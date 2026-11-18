@@ -26,10 +26,12 @@
 #include <config/state.h>
 #include <ctrl/functions.h>
 #include <ctrl/state.h>
+#include <motion/state.h>
 
 #include <QApplication>
 #include <QCheckBox>
 #include <QCloseEvent>
+#include <QComboBox>
 #include <QDialogButtonBox>
 #include <QFontMetrics>
 #include <QFrame>
@@ -763,6 +765,13 @@ void ControlsDialog::build_controller_page(int index) {
     behavior_layout->addLayout(analog_layout, 0, 1);
     t.chk_disable_motion = new QCheckBox(tr("Disable Motion Controls"), behavior_group);
     behavior_layout->addWidget(t.chk_disable_motion, 1, 0, 1, 2);
+
+    behavior_layout->addWidget(new QLabel(tr("Motion Input Source:"), behavior_group), 2, 0);
+    t.cmb_motion_input = new QComboBox(behavior_group);
+    t.cmb_motion_input->addItem(tr("Auto"), 0);
+    t.cmb_motion_input->addItem(tr("Controller / Device Sensors"), 1);
+    t.cmb_motion_input->addItem(tr("Keyboard (Numpad)"), 2);
+    behavior_layout->addWidget(t.cmb_motion_input, 2, 1);
     settings_layout->addWidget(behavior_group);
     settings_layout->addStretch();
 
@@ -775,6 +784,12 @@ void ControlsDialog::build_controller_page(int index) {
     });
     connect(t.chk_disable_motion, &QCheckBox::toggled, this, [this](bool checked) {
         set_motion_disabled(checked);
+    });
+    connect(t.cmb_motion_input, &QComboBox::currentIndexChanged, this, [this](int index) {
+        if (auto *cmb = qobject_cast<QComboBox *>(sender())) {
+            const int mode = cmb->itemData(index).toInt();
+            set_motion_input_mode(mode);
+        }
     });
 
     t.bindings = {
@@ -830,6 +845,15 @@ void ControlsDialog::refresh_shared_controller_settings() {
             const QSignalBlocker check_blocker(tab.chk_disable_motion);
             tab.chk_disable_motion->setChecked(m_emuenv.cfg.disable_motion);
         }
+        if (tab.cmb_motion_input) {
+            const QSignalBlocker cmb_blocker(tab.cmb_motion_input);
+            for (int i = 0; i < tab.cmb_motion_input->count(); ++i) {
+                if (tab.cmb_motion_input->itemData(i).toInt() == m_emuenv.cfg.motion_input_mode) {
+                    tab.cmb_motion_input->setCurrentIndex(i);
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -841,6 +865,13 @@ void ControlsDialog::set_analog_multiplier(float value) {
 
 void ControlsDialog::set_motion_disabled(bool disabled) {
     m_emuenv.cfg.disable_motion = disabled;
+    save_config();
+    refresh_shared_controller_settings();
+}
+
+void ControlsDialog::set_motion_input_mode(int mode) {
+    m_emuenv.cfg.motion_input_mode = mode;
+    m_emuenv.motion.motion_input_mode = mode;
     save_config();
     refresh_shared_controller_settings();
 }

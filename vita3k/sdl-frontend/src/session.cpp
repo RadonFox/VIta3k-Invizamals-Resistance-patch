@@ -28,6 +28,7 @@
 #include <emuenv/state.h>
 #include <ime/functions.h>
 #include <motion/event_handler.h>
+#include <motion/functions.h>
 #include <renderer/state.h>
 #include <touch/functions.h>
 #include <touch/state.h>
@@ -43,6 +44,31 @@
 namespace sdl_frontend {
 
 namespace {
+
+// Keyboard-driven fake Vita orientation (numpad). Only has an effect when the
+// configured motion input mode selects keyboard fake motion (or Auto with no
+// real motion device). Vectors are the gravity/acceleration in G the virtual
+// Vita "feels", so e.g. (0,-1,0) = held upright with the camera facing a wall.
+void handle_fake_motion_key(EmuEnvState &emuenv, SDL_Scancode scancode) {
+    if (emuenv.cfg.disable_motion)
+        return;
+    // Don't hijack the numpad when the user explicitly chose Controller-only mode.
+    if (emuenv.cfg.motion_input_mode == 1)
+        return;
+
+    switch (scancode) {
+    case SDL_SCANCODE_KP_5: set_fake_orientation(emuenv.motion, 0.0f, 0.0f, -1.0f); break; // flat, screen up
+    case SDL_SCANCODE_KP_8: set_fake_orientation(emuenv.motion, 0.0f, -1.0f, 0.0f); break; // upright, camera forward (wall)
+    case SDL_SCANCODE_KP_2: set_fake_orientation(emuenv.motion, 0.0f, 0.0f, 1.0f); break;  // face down
+    case SDL_SCANCODE_KP_4: set_fake_orientation(emuenv.motion, -1.0f, 0.0f, 0.0f); break; // landscape left
+    case SDL_SCANCODE_KP_6: set_fake_orientation(emuenv.motion, 1.0f, 0.0f, 0.0f); break;  // landscape right
+    case SDL_SCANCODE_KP_7: set_fake_orientation(emuenv.motion, -0.7071f, -0.7071f, 0.0f); break; // upright, tilted left
+    case SDL_SCANCODE_KP_9: set_fake_orientation(emuenv.motion, 0.7071f, -0.7071f, 0.0f); break;  // upright, tilted right
+    case SDL_SCANCODE_KP_1: set_fake_orientation(emuenv.motion, -0.7071f, 0.0f, -0.7071f); break; // flat, tilted left
+    case SDL_SCANCODE_KP_3: set_fake_orientation(emuenv.motion, 0.7071f, 0.0f, -0.7071f); break;  // flat, tilted right
+    default: break;
+    }
+}
 
 // SDL_Quit at the end of a session stops the audio device, so the next session opens a new one
 void reset_session_audio(EmuEnvState &emuenv) {
@@ -368,6 +394,8 @@ int run(EmuEnvState &emuenv, app::AppSessionController &session, AppLaunchReques
                 case SDL_EVENT_KEY_DOWN:
                     if (handle_ime_keydown(emuenv, hooks, event.key))
                         break;
+                    if (!event.key.repeat)
+                        handle_fake_motion_key(emuenv, event.key.scancode);
                     if (!event.key.repeat && SDL_GetKeyboardFocus() == window && !is_any_ime_active(emuenv)
                         && event.key.scancode != SDL_SCANCODE_UNKNOWN && hooks.on_guide_button) {
                         const auto &cfg = emuenv.cfg;

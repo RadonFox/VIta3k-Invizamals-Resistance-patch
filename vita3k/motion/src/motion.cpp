@@ -203,6 +203,11 @@ SceFVector3 get_basic_orientation(const MotionState &state) {
     return state.motion_data.GetBasicOrientation();
 }
 
+void set_fake_orientation(MotionState &state, float x, float y, float z) {
+    std::lock_guard<std::mutex> guard(state.mutex);
+    state.fake_acceleration = { x, y, z };
+}
+
 constexpr uint64_t to_microseconds(uint64_t ns) {
     return ns / 1000;
 }
@@ -268,8 +273,39 @@ void refresh_motion(MotionState &state, CtrlState &ctrl_state) {
     if (!state.is_sampling)
         return;
 
-    if (!ctrl_state.has_motion_support && !state.has_device_motion_support)
+    const bool has_real = ctrl_state.has_motion_support || state.has_device_motion_support;
+
+    bool use_real = false;
+    bool use_fake = false;
+    switch (state.motion_input_mode) {
+    case 1: // Controller only
+        use_real = has_real;
+        break;
+    case 2: // Keyboard (fake) only
+        use_fake = true;
+        break;
+    case 0: // Auto: real if available, otherwise fake
+    default:
+        use_real = has_real;
+        use_fake = !has_real;
+        break;
+    }
+
+    if (!use_real && !use_fake)
         return;
+
+    if (use_fake) {
+        // Feed the synthetic accelerometer reading into the motion pipeline so the
+        // orientation/quaternion/basic-orientation all converge to the held pose.
+        // Gyroscope stays at zero (static orientation, no angular rate).
+        std::lock_guard<std::mutex> guard(state.mutex);
+        state.motion_data.SetAcceleration(state.fake_acceleration);
+        // Advance timestamps by a fixed ~60 Hz delta so UpdateOrientation's
+        // sample-period guard (it bails above 0.1s) never trips.
+        constexpr uint64_t fake_delta_us = 16667;
+        state.last_updated_accel_timestamp = state.last_accel_timestamp + fake_delta_us;
+        state.last_updated_gyro_timestamp = state.last_gyro_timestamp + fake_delta_us;
+    }
 
     state.motion_data.UpdateOrientation(state.last_updated_accel_timestamp - state.last_accel_timestamp);
     state.motion_data.UpdateBasicOrientation();

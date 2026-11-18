@@ -24,6 +24,24 @@
 #include <util/tracy.h>
 TRACY_MODULE_NAME(SceMotion);
 
+// True when the game should receive motion data from any source
+// (real controller/sensor or keyboard fake motion) and motion isn't disabled.
+static bool is_motion_active(const EmuEnvState &emuenv) {
+    if (emuenv.cfg.disable_motion || !emuenv.motion.is_sampling)
+        return false;
+
+    const bool has_real = emuenv.ctrl.has_motion_support || emuenv.motion.has_device_motion_support;
+    switch (emuenv.cfg.motion_input_mode) {
+    case 1: // Controller only
+        return has_real;
+    case 2: // Keyboard (fake) only
+        return true;
+    case 0: // Auto: real if available, otherwise fake
+    default:
+        return true;
+    }
+}
+
 EXPORT(SceFloat, sceMotionGetAngleThreshold) {
     TRACY_FUNC(sceMotionGetAngleThreshold);
     return get_angle_threshold(emuenv.motion);
@@ -82,7 +100,7 @@ EXPORT(int, sceMotionGetSensorState, SceMotionSensorState *sensorState, int numR
         return RET_ERROR(SCE_MOTION_ERROR_NULL_PARAMETER);
     }
 
-    if ((emuenv.ctrl.has_motion_support || emuenv.motion.has_device_motion_support) && !emuenv.cfg.disable_motion) {
+    if (is_motion_active(emuenv)) {
         std::lock_guard<std::mutex> guard(emuenv.motion.mutex);
         sensorState->accelerometer = get_acceleration(emuenv.motion);
         sensorState->gyro = get_gyroscope(emuenv.motion);
@@ -119,7 +137,7 @@ EXPORT(int, sceMotionGetState, SceMotionState *motionState) {
         return RET_ERROR(SCE_MOTION_ERROR_NULL_PARAMETER);
     }
 
-    if ((emuenv.ctrl.has_motion_support || emuenv.motion.has_device_motion_support) && !emuenv.cfg.disable_motion) {
+    if (is_motion_active(emuenv)) {
         std::lock_guard<std::mutex> guard(emuenv.motion.mutex);
         motionState->timestamp = emuenv.motion.last_accel_timestamp;
 

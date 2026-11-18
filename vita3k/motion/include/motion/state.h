@@ -55,6 +55,14 @@ struct MotionState {
     bool has_device_motion_support = false;
     bool is_sampling = false;
 
+    // Keyboard-driven fake motion: acceleration vector the virtual Vita is held in.
+    // Default is flat/screen-up (gravity along -Z), matching real hardware at rest.
+    Util::Vec3f fake_acceleration = { 0.0f, 0.0f, -1.0f };
+
+    // Mirror of cfg.motion_input_mode (0=Auto, 1=Controller, 2=Keyboard) kept here so
+    // the motion/display modules can read it without depending on the Config type.
+    int motion_input_mode = 0;
+
     void init();
     void clear_device_motion_support();
     void refresh_device_motion_support();

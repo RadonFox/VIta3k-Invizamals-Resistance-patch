@@ -38,6 +38,7 @@ class ControlsDialog;
 class GuiSettings;
 class QCheckBox;
 class QCloseEvent;
+class QComboBox;
 class QEvent;
 class QGroupBox;
 class QKeyEvent;
@@ -183,6 +184,7 @@ private:
         QSlider *slider_analog_multiplier = nullptr;
         QLabel *lbl_analog_multiplier_value = nullptr;
         QCheckBox *chk_disable_motion = nullptr;
+        QComboBox *cmb_motion_input = nullptr;
         QPushButton *btn_reset = nullptr;
 
         std::vector<ControllerButtonBinding> bindings;
@@ -202,6 +204,7 @@ private:
     void refresh_shared_controller_settings();
     void set_analog_multiplier(float value);
     void set_motion_disabled(bool disabled);
+    void set_motion_input_mode(int mode);
 
     void init_keyboard_bindings();
     void refresh_all_keyboard_labels();

@@ -36,4 +36,8 @@ SceFloat get_angle_threshold(const MotionState &state);
 void set_angle_threshold(MotionState &state, SceFloat setValue);
 SceFVector3 get_basic_orientation(const MotionState &state);
 
+// Set the synthetic orientation used when no real motion device is available
+// (keyboard fake motion). (x, y, z) is the gravity/acceleration vector in G.
+void set_fake_orientation(MotionState &state, float x, float y, float z);
+
 void refresh_motion(MotionState &state, CtrlState &ctrl_state);

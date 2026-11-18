@@ -465,6 +465,7 @@ bool init(EmuEnvState &state, Config &cfg, const Root &root_paths) {
 #endif
 
     state.motion.init();
+    state.motion.motion_input_mode = state.cfg.motion_input_mode;
 
     if (state.cfg.controller_binds.empty() || state.cfg.controller_binds.size() != 15
         || state.cfg.controller_axis_binds.empty() || state.cfg.controller_axis_binds.size() != 6)

@@ -20,6 +20,7 @@
 
 #include <config/state.h>
 #include <ctrl/functions.h>
+#include <motion/functions.h>
 #include <touch/functions.h>
 #include <util/log.h>
 
@@ -59,6 +60,26 @@ bool CtrlKeyboardFilter::eventFilter(QObject *watched, QEvent *event) {
         update_state(key, pressed);
 
         const auto &cfg = m_emuenv.cfg;
+
+        // Numpad-driven fake Vita orientation (only active when keyboard fake motion
+        // is the selected source, or Auto with no real motion device). Requires
+        // NumLock ON so numpad digits carry the KeypadModifier. Vectors are the
+        // gravity/acceleration in G the virtual Vita "feels".
+        if (pressed && !ke->isAutoRepeat() && (ke->modifiers() & Qt::KeypadModifier)
+            && !cfg.disable_motion && cfg.motion_input_mode != 1) {
+            switch (ke->key()) {
+            case Qt::Key_5: set_fake_orientation(m_emuenv.motion, 0.0f, 0.0f, -1.0f); break;       // flat, screen up
+            case Qt::Key_8: set_fake_orientation(m_emuenv.motion, 0.0f, -1.0f, 0.0f); break;       // upright, camera forward (wall)
+            case Qt::Key_2: set_fake_orientation(m_emuenv.motion, 0.0f, 0.0f, 1.0f); break;        // face down
+            case Qt::Key_4: set_fake_orientation(m_emuenv.motion, -1.0f, 0.0f, 0.0f); break;       // landscape left
+            case Qt::Key_6: set_fake_orientation(m_emuenv.motion, 1.0f, 0.0f, 0.0f); break;        // landscape right
+            case Qt::Key_7: set_fake_orientation(m_emuenv.motion, -0.7071f, -0.7071f, 0.0f); break; // upright, tilted left
+            case Qt::Key_9: set_fake_orientation(m_emuenv.motion, 0.7071f, -0.7071f, 0.0f); break;  // upright, tilted right
+            case Qt::Key_1: set_fake_orientation(m_emuenv.motion, -0.7071f, 0.0f, -0.7071f); break; // flat, tilted left
+            case Qt::Key_3: set_fake_orientation(m_emuenv.motion, 0.7071f, 0.0f, -0.7071f); break;  // flat, tilted right
+            default: break;
+            }
+        }
         const auto matches = [key](input::PhysicalKeyCode primary, input::PhysicalKeyCode alternate) {
             return key != input::PhysicalKeyCode::Unbound && (key == primary || key == alternate);
         };

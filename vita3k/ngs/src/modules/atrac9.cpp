@@ -280,6 +280,14 @@ bool Atrac9Module::decode_more_data(KernelState &kern, const MemState &mem, cons
 
         // flush or we'll get an error next time we want to decode
         runtime->decoder->flush();
+
+        // Skip the remainder of this buffer. Without this, current_byte_position_in_buffer never
+        // advances on a decode error (the per-frame advancement below is skipped when the loop
+        // breaks), so a voice that hits repeated unpack errors never reaches end-of-data and
+        // games that gate progression on audio-playback completion stall forever. Advancing
+        // to bytes_count makes the next decode_more_data call take the buffer-exhaustion branch,
+        // which swaps to the next buffer or fires SCE_NGS_AT9_END_OF_DATA so the voice completes.
+        state->current_byte_position_in_buffer = bufparam.bytes_count;
     }
 
     logical->superframe_staging.clear();
