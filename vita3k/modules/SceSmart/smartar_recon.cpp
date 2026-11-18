@@ -15,9 +15,9 @@
 // with this program; if not, write to the Free Software Foundation, Inc.,
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
-// SmartAR recon: capture what the LLE libsmart writes into the
-// SceneMappingResult struct each frame, so we can identify the tracking-state
-// field and its "locked" value. See PROJECT.md "Next Action" Step 1.
+// SmartAR recon: capture what LLE libsmart writes / returns across the
+// idle -> color-bar-filling -> locked transition, so we can identify where
+// the game reads the tracking state from. See PROJECT.md "Next Action".
 
 #include "smartar_recon.h"
 
@@ -47,198 +47,263 @@ static constexpr uint32_t arm_blx_reg(uint8_t rm) {
 }
 
 // A resolved import stub is: MOVW r12, lo(addr); MOVT r12, hi(addr); BX r12.
-// Returns true if the 12-byte stub at `stub` targets `addr`.
 static bool stub_targets_address(const uint32_t *stub, Address addr) {
     return stub[0] == encode_arm_inst(INSTRUCTION_MOVW, static_cast<uint16_t>(addr), 12)
         && stub[1] == encode_arm_inst(INSTRUCTION_MOVT, static_cast<uint16_t>(addr >> 16), 12)
         && stub[2] == encode_arm_inst(INSTRUCTION_BRANCH, 0, 12);
 }
 
-// Write a 12-byte "MOVW/MOVT/BX r12 -> target" stub at `dest`.
 static void write_branch_stub(uint32_t *dest, Address target) {
     dest[0] = encode_arm_inst(INSTRUCTION_MOVW, static_cast<uint16_t>(target), 12);
     dest[1] = encode_arm_inst(INSTRUCTION_MOVT, static_cast<uint16_t>(target >> 16), 12);
     dest[2] = encode_arm_inst(INSTRUCTION_BRANCH, 0, 12);
 }
 
-void install_smartar_recon_hook(EmuEnvState &emuenv) {
-    static bool installed = false; // idempotent: safe to call from multiple load paths
-    if (installed) {
-        LOG_DEBUG("SmartAR recon: hook already installed, skipping");
-        return;
-    }
+// Emit a generic trampoline that:
+//   1. saves entry r0 -> r4, r1 -> r5 (callee-saved across the LLE call)
+//   2. calls the original LLE function at lle_addr
+//   3. saves retval (r0) -> r6
+//   4. sets r0 = entry r0, r1 = entry r1, r2 = retval, then calls log_stub
+//      (the host dump handler reads r0/r1/r2 to log whatever it needs)
+//   5. restores r0 = retval and returns to the game
+// r4-r6 + lr are saved/restored (AAPCS-correct).
+//
+//       push {r4-r6, lr}
+//       mov  r4, r0
+//       mov  r5, r1
+//       movw/movt r12, lle ; blx r12
+//       mov  r6, r0
+//       mov  r0, r4
+//       mov  r1, r5
+//       mov  r2, r6
+//       movw/movt r12, log ; blx r12
+//       mov  r0, r6
+//       pop  {r4-r6, pc}
+static Address emit_generic_trampoline(MemState &mem, Address lle_addr, Address log_stub_addr) {
+    Address tramp = alloc(mem, 64, "smartar_recon_trampoline");
+    if (!tramp)
+        return 0;
+    uint32_t *tr = Ptr<uint32_t>(tramp).get(mem);
+    const uint16_t lle_lo = static_cast<uint16_t>(lle_addr);
+    const uint16_t lle_hi = static_cast<uint16_t>(lle_addr >> 16);
+    const uint16_t log_lo = static_cast<uint16_t>(log_stub_addr);
+    const uint16_t log_hi = static_cast<uint16_t>(log_stub_addr >> 16);
+    int i = 0;
+    tr[i++] = 0xE92D4070u; // push {r4-r6, lr}
+    tr[i++] = arm_mov(4, 0); // mov r4, r0
+    tr[i++] = arm_mov(5, 1); // mov r5, r1
+    tr[i++] = encode_arm_inst(INSTRUCTION_MOVW, lle_lo, 12);
+    tr[i++] = encode_arm_inst(INSTRUCTION_MOVT, lle_hi, 12);
+    tr[i++] = arm_blx_reg(12); // blx r12 (call LLE)
+    tr[i++] = arm_mov(6, 0); // mov r6, r0 (save retval)
+    tr[i++] = arm_mov(0, 4); // mov r0, r4 (entry r0)
+    tr[i++] = arm_mov(1, 5); // mov r1, r5 (entry r1)
+    tr[i++] = arm_mov(2, 6); // mov r2, r6 (retval)
+    tr[i++] = encode_arm_inst(INSTRUCTION_MOVW, log_lo, 12);
+    tr[i++] = encode_arm_inst(INSTRUCTION_MOVT, log_hi, 12);
+    tr[i++] = arm_blx_reg(12); // blx r12 (log SVC)
+    tr[i++] = arm_mov(0, 6); // mov r0, r6 (restore retval)
+    tr[i++] = 0xE8BD8070u; // pop {r4-r6, pc}
+    for (; i < 16; ++i)
+        tr[i] = 0xE1A00000u; // NOP
+    return tramp;
+}
 
+// Allocate a 12-byte SVC stub: svc #0; mov pc, lr; log_nid
+static Address alloc_log_svc_stub(MemState &mem, uint32_t log_nid) {
+    Address stub_addr = alloc(mem, 12, "smartar_recon_log_svc");
+    if (!stub_addr)
+        return 0;
+    uint32_t *stub = Ptr<uint32_t>(stub_addr).get(mem);
+    stub[0] = 0xEF000000u;
+    stub[1] = 0xE1A0F00Eu;
+    stub[2] = log_nid;
+    return stub_addr;
+}
+
+// Install a generic trampoline wrapping the LLE export for `func_nid`, routing
+// the post-call log trap to `log_nid`. Idempotent per func_nid.
+static void install_wrapper(EmuEnvState &emuenv, uint32_t func_nid, uint32_t log_nid, const char *name) {
     auto &kernel = emuenv.kernel;
     auto &mem = emuenv.mem;
 
     Address lle_addr = 0;
     {
         const std::lock_guard<std::mutex> guard(kernel.export_nids_mutex);
-        const auto it = kernel.export_nids.find(SMARTAR_DISPATCH_NID);
+        const auto it = kernel.export_nids.find(func_nid);
         if (it == kernel.export_nids.end() || it->second == 0) {
-            LOG_INFO("SmartAR recon: sceSmartSceneMappingDispatchAndQuery export not found; "
-                     "libsmart is HLE or not loaded yet. Recon hook not installed.");
+            LOG_INFO("SmartAR recon: {} export not found (HLE or not loaded); skipping", name);
             return;
         }
         lle_addr = it->second;
-    }
-
-    // If the export is already an SVC stub (HLE), there's nothing to wrap.
-    {
-        const uint32_t *stub = Ptr<uint32_t>(lle_addr).get(mem);
-        if (stub && stub[0] == 0xEF000000u && stub[1] == 0xE1A0F00Eu) {
-            LOG_INFO("SmartAR recon: export at {} is already an HLE SVC stub; nothing to wrap.",
-                log_hex(lle_addr));
+        // If already wrapped (lle_addr is one of our trampolines), skip.
+        const uint32_t *p = Ptr<uint32_t>(lle_addr).get(mem);
+        if (p && p[0] == 0xE92D4070u) {
+            LOG_DEBUG("SmartAR recon: {} already wrapped", name);
             return;
         }
     }
 
-    // 1) Dump SVC stub: svc #0; mov pc, lr; SMARTAR_RECON_DUMP_NID
-    //    The host call_import() special-cases this NID to dump the result struct.
-    Address dump_stub_addr = alloc(mem, 12, "smartar_recon_dump_stub");
-    if (!dump_stub_addr) {
-        LOG_ERROR("SmartAR recon: failed to allocate dump SVC stub");
+    // Skip if export is an HLE SVC stub (no LLE to wrap).
+    {
+        const uint32_t *p = Ptr<uint32_t>(lle_addr).get(mem);
+        if (p && p[0] == 0xEF000000u && p[1] == 0xE1A0F00Eu) {
+            LOG_INFO("SmartAR recon: {} export is HLE SVC stub; nothing to wrap", name);
+            return;
+        }
+    }
+
+    Address log_stub = alloc_log_svc_stub(mem, log_nid);
+    if (!log_stub) {
+        LOG_ERROR("SmartAR recon: failed to alloc log SVC for {}", name);
         return;
     }
-    uint32_t *dump_stub = Ptr<uint32_t>(dump_stub_addr).get(mem);
-    dump_stub[0] = 0xEF000000u; // svc #0
-    dump_stub[1] = 0xE1A0F00Eu; // mov pc, lr
-    dump_stub[2] = SMARTAR_RECON_DUMP_NID;
-
-    // 2) Trampoline (ARM, 11 instructions = 44 bytes; allocate 64).
-    //    Entry args: r0=ctx, r1=result, r2, r3. lr = caller (game) return.
-    //    r4-r6 are callee-saved (AAPCS): the game expects them preserved, so
-    //    we push/pop them. r12 is caller-saved scratch.
-    //
-    //      push {r4-r6, lr}     ; save callee-saved + game return addr
-    //      mov  r4, r1          ; r4 = result ptr (preserved across LLE call)
-    //      movw r12, lo(lle)    ;
-    //      movt r12, hi(lle)    ;
-    //      blx  r12             ; call original LLE; r0 = retval; r4 preserved
-    //      mov  r6, r0          ; r6 = LLE retval (preserved across dump call)
-    //      mov  r1, r4          ; r1 = result ptr (read by host dump handler)
-    //      movw r12, lo(dump)   ;
-    //      movt r12, hi(dump)   ;
-    //      blx  r12             ; trap to host dump; r0 = 0; r4/r6 preserved
-    //      mov  r0, r6          ; restore LLE retval
-    //      pop  {r4-r6, pc}     ; restore r4-r6 and return to game
-    Address trampoline_addr = alloc(mem, 64, "smartar_recon_trampoline");
-    if (!trampoline_addr) {
-        LOG_ERROR("SmartAR recon: failed to allocate trampoline");
-        free(mem, dump_stub_addr);
+    Address tramp = emit_generic_trampoline(mem, lle_addr, log_stub);
+    if (!tramp) {
+        LOG_ERROR("SmartAR recon: failed to alloc trampoline for {}", name);
+        free(mem, log_stub);
         return;
     }
-    uint32_t *tr = Ptr<uint32_t>(trampoline_addr).get(mem);
-    const uint16_t lle_lo = static_cast<uint16_t>(lle_addr);
-    const uint16_t lle_hi = static_cast<uint16_t>(lle_addr >> 16);
-    const uint16_t dump_lo = static_cast<uint16_t>(dump_stub_addr);
-    const uint16_t dump_hi = static_cast<uint16_t>(dump_stub_addr >> 16);
-    int i = 0;
-    tr[i++] = 0xE92D4070u; // push {r4-r6, lr}
-    tr[i++] = arm_mov(4, 1); // mov r4, r1
-    tr[i++] = encode_arm_inst(INSTRUCTION_MOVW, lle_lo, 12); // movw r12, lo(lle)
-    tr[i++] = encode_arm_inst(INSTRUCTION_MOVT, lle_hi, 12); // movt r12, hi(lle)
-    tr[i++] = arm_blx_reg(12); // blx r12 (call LLE)
-    tr[i++] = arm_mov(6, 0); // mov r6, r0
-    tr[i++] = arm_mov(1, 4); // mov r1, r4
-    tr[i++] = encode_arm_inst(INSTRUCTION_MOVW, dump_lo, 12); // movw r12, lo(dump)
-    tr[i++] = encode_arm_inst(INSTRUCTION_MOVT, dump_hi, 12); // movt r12, hi(dump)
-    tr[i++] = arm_blx_reg(12); // blx r12 (dump SVC)
-    tr[i++] = arm_mov(0, 6); // mov r0, r6
-    tr[i++] = 0xE8BD8070u; // pop {r4-r6, pc}
-    // NOP remaining bytes (instructions 12..15)
-    for (; i < 16; ++i)
-        tr[i] = 0xE1A00000u; // mov r0, r0 (NOP)
 
-    kernel.invalidate_jit_cache(trampoline_addr, 64);
-    kernel.invalidate_jit_cache(dump_stub_addr, 12);
+    kernel.invalidate_jit_cache(tramp, 64);
+    kernel.invalidate_jit_cache(log_stub, 12);
 
-    // 3) Re-patch every game import stub that currently targets the LLE address
-    //    so it jumps to our trampoline instead. After libsmart loaded,
-    //    load_func_exports() already rewrote matching stubs to -> lle_addr, so
-    //    we identify them by that target. Stubs still in SVC (HLE fallback) form
-    //    are left untouched.
     int patched = 0;
     {
         const std::lock_guard<std::mutex> guard(kernel.export_nids_mutex);
-        auto range = kernel.func_binding_infos.equal_range(SMARTAR_DISPATCH_NID);
+        auto range = kernel.func_binding_infos.equal_range(func_nid);
         for (auto it = range.first; it != range.second; ++it) {
             const Address stub_addr = it->second.entry_address;
             uint32_t *stub = Ptr<uint32_t>(stub_addr).get(mem);
-            if (!stub)
+            if (!stub || !stub_targets_address(stub, lle_addr))
                 continue;
-            if (!stub_targets_address(stub, lle_addr))
-                continue;
-            write_branch_stub(stub, trampoline_addr);
+            write_branch_stub(stub, tramp);
             kernel.invalidate_jit_cache(stub_addr, 12);
             ++patched;
         }
-        // Point future resolutions to the trampoline too (modules loaded later
-        // that import this NID should also be wrapped).
-        kernel.export_nids[SMARTAR_DISPATCH_NID] = trampoline_addr;
+        kernel.export_nids[func_nid] = tramp;
     }
 
-    LOG_INFO("SmartAR recon: installed trampoline at {} wrapping LLE DispatchAndQuery "
-             "at {} (dump SVC at {}); patched {} import stub(s)",
-        log_hex(trampoline_addr), log_hex(lle_addr), log_hex(dump_stub_addr), patched);
-    installed = true;
+    LOG_INFO("SmartAR recon: wrapped {} (NID {}) trampoline={} lle={} log_svc={} patched={}",
+        name, log_hex(func_nid), log_hex(tramp), log_hex(lle_addr), log_hex(log_stub), patched);
 }
 
-void smartar_recon_dump_result(EmuEnvState &emuenv, CPUState &cpu) {
-    // Throttle: log the first 20 frames densely (to catch the idle -> color bar
-    // filling -> locked transition), then every 30th, so we capture the
-    // progression without flooding the log.
-    static uint32_t frame = 0;
-    static uint32_t logged = 0;
-    ++frame;
-    const bool do_log = (logged < 20) || (frame % 30 == 0);
-    if (!do_log)
-        return;
-
-    const Address result_ptr = cpu.get_reg(1);
-    if (result_ptr == 0) {
-        LOG_INFO("SmartAR recon [frame {}]: result ptr r1 = 0 (null), skipping dump", frame);
+void install_smartar_recon_hook(EmuEnvState &emuenv) {
+    static bool installed = false;
+    if (installed) {
+        LOG_DEBUG("SmartAR recon: hooks already installed, skipping");
         return;
     }
 
-    auto dump_region = [&emuenv](Address addr, size_t bytes, const char *label) {
-        if (addr == 0) {
-            LOG_INFO("  {}: <null pointer>", label);
-            return;
-        }
-        const uint8_t *data = Ptr<uint8_t>(addr).get(emuenv.mem);
-        if (!data) {
-            LOG_INFO("  {}: ptr {} maps to no host memory", label, log_hex(addr));
-            return;
-        }
-        for (size_t off = 0; off < bytes; off += 16) {
-            uint32_t words[4] = {};
-            std::memcpy(words, data + off, sizeof(words));
-            LOG_INFO("  {} +0x{:02x}: {:08X} {:08X} {:08X} {:08X}",
-                label, off, words[0], words[1], words[2], words[3]);
-        }
-    };
+    // DispatchAndQuery (per-frame query; result struct at entry r1)
+    install_wrapper(emuenv, 0xF10FDDD1u, SMARTAR_RECON_DUMP_NID, "sceSmartSceneMappingDispatchAndQuery");
+    // Count-returning queries — these are likely where the game reads
+    // "color bar full" (init points) and "tracking locked" (landmarks).
+    install_wrapper(emuenv, 0xDF900B29u, SMARTAR_RECON_NUM_INIT_POINTS_NID, "sceSmartSceneMappingGetNumInitializationPoints");
+    install_wrapper(emuenv, 0x2260E8BBu, SMARTAR_RECON_NUM_LANDMARKS_NID, "sceSmartSceneMappingGetNumLandmarks");
+    // Per-point info (fills a buffer at entry r0).
+    install_wrapper(emuenv, 0x9A578A29u, SMARTAR_RECON_INIT_POINT_INFO_NID, "sceSmartSceneMappingGetInitializationPointInfo");
 
-    LOG_INFO("SmartAR recon [frame {}] SceneMappingResult @ {} (r0={})",
-        frame, log_hex(result_ptr), log_hex(cpu.get_reg(0)));
+    installed = true;
+    LOG_INFO("SmartAR recon: all wrappers installed");
+}
 
-    // Main struct (64 bytes per +0x00 size field)
-    dump_region(result_ptr, 64, "main");
+// ---- host-side dump handlers ----
 
-    // Follow the double-buffered data pointers. The actual tracking state +
-    // pose live in the structures these point to.
+static void dump_hex(EmuEnvState &emuenv, Address addr, size_t bytes, const char *label) {
+    if (addr == 0) {
+        LOG_INFO("    {}: <null>", label);
+        return;
+    }
+    const uint8_t *data = Ptr<uint8_t>(addr).get(emuenv.mem);
+    if (!data) {
+        LOG_INFO("    {}: ptr {} maps to no host memory", label, log_hex(addr));
+        return;
+    }
+    for (size_t off = 0; off < bytes; off += 16) {
+        uint32_t words[4] = {};
+        std::memcpy(words, data + off, sizeof(words));
+        LOG_INFO("    {} +0x{:02x}: {:08X} {:08X} {:08X} {:08X}",
+            label, off, words[0], words[1], words[2], words[3]);
+    }
+}
+
+static uint32_t frame = 0;
+static uint32_t logged = 0;
+
+// DispatchAndQuery: entry r0=ctx, r1=result struct ptr; retval in r2.
+static void dump_dispatch_and_query(EmuEnvState &emuenv, CPUState &cpu) {
+    const Address result_ptr = cpu.get_reg(1); // entry r1
+    const uint32_t retval = cpu.get_reg(2); // LLE retval
+
+    LOG_INFO("SmartAR recon [frame {}] DispatchAndQuery retval={} result@={}",
+        frame, log_hex(retval), log_hex(result_ptr));
+    if (result_ptr == 0)
+        return;
+
+    dump_hex(emuenv, result_ptr, 96, "main");
+
+    // Follow the double-buffered data pointers (+0x04, +0x10) and config (+0x18).
     const uint8_t *base = Ptr<uint8_t>(result_ptr).get(emuenv.mem);
     if (base) {
         uint32_t p04 = 0, p10 = 0, p18 = 0;
         std::memcpy(&p04, base + 0x04, 4);
         std::memcpy(&p10, base + 0x10, 4);
         std::memcpy(&p18, base + 0x18, 4);
-        dump_region(p04, 128, "p04");
-        dump_region(p10, 128, "p10");
-        // +0x18 is a constant pointer across frames; dump once in a while to
-        // see if it's a config/static-state struct.
+        dump_hex(emuenv, p04, 128, "p04");
+        dump_hex(emuenv, p10, 128, "p10");
         if (logged < 5 || frame % 300 == 0)
-            dump_region(p18, 128, "p18");
+            dump_hex(emuenv, p18, 128, "p18");
     }
-    ++logged;
+}
+
+// GetNumInitializationPoints / GetNumLandmarks: count in retval (r2).
+static void dump_count(EmuEnvState &emuenv, CPUState &cpu, const char *name) {
+    const uint32_t count = cpu.get_reg(2);
+    LOG_INFO("SmartAR recon [frame {}] {} -> count={}",
+        frame, name, count);
+}
+
+// GetInitializationPointInfo: entry r0=out buf, r1=size, r2=index? (r2 is retval here)
+// Note: our generic trampoline overwrites entry r2 with retval, so index isn't
+// available; r0=buf, r1=size, r2=retval.
+static void dump_init_point_info(EmuEnvState &emuenv, CPUState &cpu) {
+    const Address buf = cpu.get_reg(0); // entry r0
+    const uint32_t size = cpu.get_reg(1); // entry r1
+    const uint32_t retval = cpu.get_reg(2); // LLE retval
+    LOG_INFO("SmartAR recon [frame {}] GetInitializationPointInfo retval={} buf={} size={}",
+        frame, log_hex(retval), log_hex(buf), size);
+    if (buf && size > 0 && size <= 256)
+        dump_hex(emuenv, buf, size, "ipi");
+}
+
+void smartar_recon_dump_result(EmuEnvState &emuenv, CPUState &cpu, uint32_t log_nid) {
+    ++frame;
+
+    // Throttle: DispatchAndQuery is called every frame and is expensive to dump.
+    // Count functions are cheap and more informative for state transitions —
+    // log them every time they're called (they're called less often than
+    // DispatchAndQuery, typically a few times per frame).
+    switch (log_nid) {
+    case SMARTAR_RECON_DUMP_NID: {
+        const bool do_log = (logged < 20) || (frame % 30 == 0);
+        if (!do_log)
+            return;
+        dump_dispatch_and_query(emuenv, cpu);
+        ++logged;
+        break;
+    }
+    case SMARTAR_RECON_NUM_INIT_POINTS_NID:
+        dump_count(emuenv, cpu, "GetNumInitializationPoints");
+        break;
+    case SMARTAR_RECON_NUM_LANDMARKS_NID:
+        dump_count(emuenv, cpu, "GetNumLandmarks");
+        break;
+    case SMARTAR_RECON_INIT_POINT_INFO_NID:
+        dump_init_point_info(emuenv, cpu);
+        break;
+    default:
+        // Unknown recon NID — ignore.
+        break;
+    }
 }

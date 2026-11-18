@@ -151,12 +151,18 @@ static void log_import_call(char emulation_level, uint32_t nid, SceUID thread_id
 }
 
 CallResult call_import(EmuEnvState &emuenv, CPUState &cpu, uint32_t nid, SceUID thread_id) {
-    // SmartAR recon dump stub: the guest trampoline calls the original LLE
-    // sceSmartSceneMappingDispatchAndQuery, then traps here via a synthetic
-    // SVC stub so we can log the contents of the result struct at r1.
-    if (nid == SMARTAR_RECON_DUMP_NID) {
-        smartar_recon_dump_result(emuenv, cpu);
+    // SmartAR recon: the guest trampolines call the original LLE SmartAR
+    // functions, then trap here via synthetic SVC stubs so we can log the
+    // function's outputs (result struct, return-value counts, filled buffers).
+    switch (nid) {
+    case SMARTAR_RECON_DUMP_NID:
+    case SMARTAR_RECON_NUM_INIT_POINTS_NID:
+    case SMARTAR_RECON_NUM_LANDMARKS_NID:
+    case SMARTAR_RECON_INIT_POINT_INFO_NID:
+        smartar_recon_dump_result(emuenv, cpu, nid);
         return { .regs = { 0 }, .count = 1 };
+    default:
+        break;
     }
 
     // HLE - call our C++ function
