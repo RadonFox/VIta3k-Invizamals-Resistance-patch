@@ -159,6 +159,8 @@ CallResult call_import(EmuEnvState &emuenv, CPUState &cpu, uint32_t nid, SceUID 
     case SMARTAR_RECON_NUM_INIT_POINTS_NID:
     case SMARTAR_RECON_NUM_LANDMARKS_NID:
     case SMARTAR_RECON_INIT_POINT_INFO_NID:
+    case SMARTAR_RECON_LANDMARK_INFO_NID:
+    case SMARTAR_RECON_PROPAGATE_RESULT_NID:
         smartar_recon_dump_result(emuenv, cpu, nid);
         return { .regs = { 0 }, .count = 1 };
     default:

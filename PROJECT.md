@@ -181,6 +181,33 @@ alternate in lockstep — classic double-buffering: LLE writes buffer A while th
 game reads buffer B, then swaps). The wrapper is just a header (size, two
 double-buffered data pointers, timestamp).
 
+**Session 3b capture (with pointer-following):** p04 (the +0x04 sub-struct) is
+**all zeros across all phases** — it's the pose OUTPUT buffer, empty because
+tracking never locks. p10 (the +0x10 sub-struct) is the camera image/feature
+buffer (zeros when idle → uniform `0x03` during color-bar fill → real webcam
+bytes `0x0F-0xFE` in sparks). p18 (+0x18) is static config (`00000005...` = the
+`flags=5` from SceneMappingStart). The main struct (0-95 bytes) is fully static.
+
+**Session 3c capture (wrapped all 7 game-called functions):**
+- `GetNumInitializationPoints` (0xDF900B29) and `GetNumLandmarks` (0x2260E8BB)
+  are **never called by the game** (`patched=0` — the game doesn't even import
+  them). The game does NOT query counts via these.
+- `GetInitializationPointInfo` (0x9A578A29) is called **10,632 times** — this is
+  the game's main per-frame info query. Its **retval IS the init-point count**
+  (transitions 0 → 0x1C(28) → 0x3(3) → 0x2A(42) → 0x39(57) as features are
+  detected/lost). Its 64-byte buffer contains **floats = 2D pixel coordinates**
+  of detected init points (e.g. 475.5, 300.5, 112.5, 282.5...), packed as
+  repeated (id, x, y, 0) tuples. The color bar fills based on this count.
+- `GetLandmarkInfo` (0xB17057EA) and `PropagateResult` (0x5A9EC64D) — wrapped in
+  Session 3d (pending capture). Landmarks appear only when SLAM tracking locks;
+  `PropagateResult` likely carries the tracking result/state to the game.
+
+**Working hypothesis:** "tracking locked" = landmarks exist (GetLandmarkInfo
+returns non-empty data). Since SLAM can't solve in the emulator, landmarks never
+appear → game stays in sparks. The hybrid HLE override (Step 2) likely needs to
+fake `GetLandmarkInfo` to return a valid landmark + pose, possibly also filling
+the p04 pose buffer via `DispatchAndQuery`'s result.
+
 **Open question:** which sub-struct (+0x04 or +0x10) holds the tracking state,
 and at what offset? Step 1b extends the dump to follow these pointers (128 bytes
 each) and captures the **idle → color-bar-filling → locked transition** (the

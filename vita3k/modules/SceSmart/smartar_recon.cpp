@@ -30,6 +30,7 @@
 #include <util/arm.h>
 #include <util/log.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
@@ -203,6 +204,10 @@ void install_smartar_recon_hook(EmuEnvState &emuenv) {
     install_wrapper(emuenv, 0x2260E8BBu, SMARTAR_RECON_NUM_LANDMARKS_NID, "sceSmartSceneMappingGetNumLandmarks");
     // Per-point info (fills a buffer at entry r0).
     install_wrapper(emuenv, 0x9A578A29u, SMARTAR_RECON_INIT_POINT_INFO_NID, "sceSmartSceneMappingGetInitializationPointInfo");
+    // Landmark info (fills a buffer at entry r0, size at entry r1=512).
+    install_wrapper(emuenv, 0xB17057EAu, SMARTAR_RECON_LANDMARK_INFO_NID, "sceSmartSceneMappingGetLandmarkInfo");
+    // PropagateResult (entry r0 = result/state ptr; we dump 64 bytes at it).
+    install_wrapper(emuenv, 0x5A9EC64Du, SMARTAR_RECON_PROPAGATE_RESULT_NID, "sceSmartSceneMappingPropagateResult");
 
     installed = true;
     LOG_INFO("SmartAR recon: all wrappers installed");
@@ -241,7 +246,7 @@ static void dump_dispatch_and_query(EmuEnvState &emuenv, CPUState &cpu) {
     if (result_ptr == 0)
         return;
 
-    dump_hex(emuenv, result_ptr, 96, "main");
+    dump_hex(emuenv, result_ptr, 128, "main");
 
     // Follow the double-buffered data pointers (+0x04, +0x10) and config (+0x18).
     const uint8_t *base = Ptr<uint8_t>(result_ptr).get(emuenv.mem);
@@ -266,15 +271,48 @@ static void dump_count(EmuEnvState &emuenv, CPUState &cpu, const char *name) {
 
 // GetInitializationPointInfo: entry r0=out buf, r1=size, r2=index? (r2 is retval here)
 // Note: our generic trampoline overwrites entry r2 with retval, so index isn't
-// available; r0=buf, r1=size, r2=retval.
+// available; r0=buf, r1=size, r2=retval. retval is the init-point count.
+static uint32_t ipi_logged = 0;
 static void dump_init_point_info(EmuEnvState &emuenv, CPUState &cpu) {
     const Address buf = cpu.get_reg(0); // entry r0
     const uint32_t size = cpu.get_reg(1); // entry r1
+    const uint32_t retval = cpu.get_reg(2); // LLE retval = init point count
+    // Always log the retval (count) — it's the state signal. Throttle the
+    // buffer dump (it's verbose and mostly coordinate floats).
+    const bool dump_buf = (ipi_logged < 10) || (frame % 500 == 0);
+    if (dump_buf) {
+        LOG_INFO("SmartAR recon [frame {}] GetInitializationPointInfo count={} buf={} size={}",
+            frame, retval, log_hex(buf), size);
+        if (buf && size > 0 && size <= 256)
+            dump_hex(emuenv, buf, size, "ipi");
+        ++ipi_logged;
+    } else {
+        LOG_INFO("SmartAR recon [frame {}] GetInitializationPointInfo count={}", frame, retval);
+    }
+}
+
+// GetLandmarkInfo: entry r0=out buf, r1=size(=512). retval in r2.
+// Landmarks appear only when SLAM tracking locks — so any non-zero retval or
+// non-zero buffer content here is the "tracking locked" signal we're hunting.
+static void dump_landmark_info(EmuEnvState &emuenv, CPUState &cpu) {
+    const Address buf = cpu.get_reg(0); // entry r0
+    const uint32_t size = cpu.get_reg(1); // entry r1
     const uint32_t retval = cpu.get_reg(2); // LLE retval
-    LOG_INFO("SmartAR recon [frame {}] GetInitializationPointInfo retval={} buf={} size={}",
+    LOG_INFO("SmartAR recon [frame {}] GetLandmarkInfo retval={} buf={} size={}",
         frame, log_hex(retval), log_hex(buf), size);
-    if (buf && size > 0 && size <= 256)
-        dump_hex(emuenv, buf, size, "ipi");
+    if (buf && size > 0 && size <= 1024)
+        dump_hex(emuenv, buf, std::min<uint32_t>(size, 128), "lmi");
+}
+
+// PropagateResult: entry r0 = result/state ptr (we dump 64 bytes at it).
+static void dump_propagate_result(EmuEnvState &emuenv, CPUState &cpu) {
+    const Address state_ptr = cpu.get_reg(0); // entry r0
+    const uint32_t arg1 = cpu.get_reg(1); // entry r1
+    const uint32_t retval = cpu.get_reg(2); // LLE retval
+    LOG_INFO("SmartAR recon [frame {}] PropagateResult retval={} state@={} arg1={}",
+        frame, log_hex(retval), log_hex(state_ptr), log_hex(arg1));
+    if (state_ptr)
+        dump_hex(emuenv, state_ptr, 64, "prop");
 }
 
 void smartar_recon_dump_result(EmuEnvState &emuenv, CPUState &cpu, uint32_t log_nid) {
@@ -301,6 +339,12 @@ void smartar_recon_dump_result(EmuEnvState &emuenv, CPUState &cpu, uint32_t log_
         break;
     case SMARTAR_RECON_INIT_POINT_INFO_NID:
         dump_init_point_info(emuenv, cpu);
+        break;
+    case SMARTAR_RECON_LANDMARK_INFO_NID:
+        dump_landmark_info(emuenv, cpu);
+        break;
+    case SMARTAR_RECON_PROPAGATE_RESULT_NID:
+        dump_propagate_result(emuenv, cpu);
         break;
     default:
         // Unknown recon NID — ignore.

@@ -35,6 +35,8 @@ constexpr uint32_t SMARTAR_RECON_DUMP_NID = 0xDEAD0001u; // DispatchAndQuery (re
 constexpr uint32_t SMARTAR_RECON_NUM_INIT_POINTS_NID = 0xDEAD0010u; // GetNumInitializationPoints (retval=count)
 constexpr uint32_t SMARTAR_RECON_NUM_LANDMARKS_NID = 0xDEAD0011u; // GetNumLandmarks (retval=count)
 constexpr uint32_t SMARTAR_RECON_INIT_POINT_INFO_NID = 0xDEAD0012u; // GetInitializationPointInfo (buf fill)
+constexpr uint32_t SMARTAR_RECON_LANDMARK_INFO_NID = 0xDEAD0013u; // GetLandmarkInfo (buf fill, size=512)
+constexpr uint32_t SMARTAR_RECON_PROPAGATE_RESULT_NID = 0xDEAD0014u; // PropagateResult (r0=state ptr)
 
 // Install guest-ARM trampolines wrapping the LLE SmartAR functions listed above.
 // Each trampoline calls the original LLE function (so 2D detection / color bar
