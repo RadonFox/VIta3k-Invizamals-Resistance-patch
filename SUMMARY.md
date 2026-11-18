@@ -2,7 +2,7 @@
 
 ## Project: Invizimals: The Resistance on Vita3K
 
-**Status:** Partially working — past face-confirm, wall detection, and camera color-lock. Blocked at the Xtractor shooting minigame (objects won't spawn).
+**Status:** Partially working — past face-confirm, wall detection, and camera color-lock. Blocked at the Xtractor shooting minigame (objects won't spawn). Recon of the SmartAR API is complete; first hybrid HLE override attempt did not work; next attempt planned.
 
 ---
 
@@ -24,36 +24,34 @@ This minigame is **required to progress the story**.
 
 ## The path forward: hybrid HLE override
 
-Full HLE replacement of SmartAR doesn't work (it breaks the 2D feature detection that fills the color bar). Instead, the plan is a **hybrid approach**:
+Full HLE replacement of SmartAR doesn't work (it breaks the 2D feature detection that fills the color bar). Instead, the plan is a **hybrid approach**: keep SmartAR running as LLE (real binary) so 2D detection works, then override specific outputs to fake "tracking locked".
 
-1. Keep SmartAR running as LLE (real binary) so 2D feature detection works
-2. After `libsmart.suprx` loads, use Vita3K's `register_hle_override()` (in `taiHEN.cpp`) to redirect specific SmartAR export functions to HLE stubs
-3. Override `sceSmartSceneMappingDispatchAndQuery` to inject "tracking locked" into the result struct
-4. The challenge: we need to know which field in the 64-byte result struct is the tracking state, and what value means "locked"
+## Recon findings (Step 1 — COMPLETE)
 
-## What we know from recon
+A guest-ARM trampoline was built (`vita3k/modules/SceSmart/smartar_recon.cpp`) that wraps the LLE SmartAR functions: it calls the original LLE function (so detection still works), then traps to the host to log the function's outputs. Captures across the idle → color-bar-filling → sparks transition revealed:
 
-The game calls 7 SmartAR functions (all SceneMapping/SLAM, no TargetTracking):
+| Function | What it does | Recon finding |
+|----------|--------------|---------------|
+| `sceSmartSceneMappingDispatchAndQuery` | per-frame SLAM query | Result struct = static header (size, double-buffered data ptrs, timestamp). Pose output buffer (p04) all zeros — never populated. Camera image buffer (p10) has the feed. |
+| `sceSmartSceneMappingGetInitializationPointInfo` | init-point info | **retval = init-point count** (0→28→3→42→57). Buffer = float 2D pixel coords of features. Drives the color bar. |
+| `sceSmartSceneMappingGetLandmarkInfo` | landmark info | **ALWAYS retval=0, empty 512-byte buffer.** SLAM never produces landmarks. ← the "not locked" gate |
+| `sceSmartSceneMappingGetNumInitializationPoints` / `GetNumLandmarks` | count queries | **Never called by the game** (not imported). |
+| `sceSmartSceneMappingPropagateResult` | apply result | retval=0 (success) mostly; `prop` buffer = static identity-ish pose (+0x08=1, +0x1C=1.0f, +0x20=0x80000000). |
 
-| Function | Signature | Purpose |
-|----------|-----------|---------|
-| `sceSmartInit` | `(Ptr config, int mode)` | Init library |
-| `sceSmartSceneMappingStart` | `(int flags=5, int enable=1)` | Start SLAM |
-| `sceSmartSceneMappingDispatchAndQuery` | `(Ptr ctx, Ptr result, int, int)` | **Per-frame query — result struct at r1 (64+ bytes) holds tracking state** |
-| `sceSmartSceneMappingGetInitializationPointInfo` | `(Ptr out, int size=64, int index)` | Init point info (color bar) |
-| `sceSmartSceneMappingGetLandmarkInfo` | `(Ptr out, int size=512, Ptr ctx, int index)` | Landmark info |
-| `sceSmartSceneMappingPropagateResult` | `(Ptr, int, int, int)` | Propagate results |
-| `sceSmartSceneMappingReset` | `(int, int, int, int)` | Reset tracking |
+The game polls `GetLandmarkInfo` every frame and always gets 0/empty → never sees "tracking locked" → sits in sparks.
 
-The result struct passed to `DispatchAndQuery` is pre-filled with `0xDEADBEEF` sentinels. With LLE, SmartAR fills in real data. We need to determine the tracking state field and its "locked" value.
+## Step 2 — hybrid HLE override (IN PROGRESS)
 
-## Next step
+**Experiment 1 (DONE — did not work):** Forced `prop+0x08 = 2` (hypothesis: `SceSmartSceneMappingState` NORMAL/tracking-locked) and `prop+0x20 = 0` (clear "invalid" flag) in the `PropagateResult` trampoline after LLE ran. Override applied on all 2,391 calls, but `GetLandmarkInfo` stayed 0 and nothing spawned. The `prop` buffer state enum is **not** the gate the game checks.
 
-**Branch: `hybrid-hle-override`**
+**Next (Experiment 2):** Fake `GetLandmarkInfo` — override retval to non-zero and fill the 512-byte buffer with a minimal fake landmark. Unknown: the landmark struct layout (SmartAR landmarks are 3D map points: position + descriptor + quality). Risk: wrong layout → crash or no effect.
 
-Implement the hybrid approach:
-1. Find a way to call the original LLE `sceSmartSceneMappingDispatchAndQuery`, then modify its output to set tracking state = "locked"
-2. If that's not possible, study the result struct by comparing LLE output (when color bar fills) vs the 0xDEADBEEF pre-fill to identify the tracking state field
-3. Use `register_hle_override()` to redirect the function after `libsmart.suprx` loads
+**Decisive fallback (Experiment 4):** Disassemble the game binary around the `GetLandmarkInfo` / `DispatchAndQuery` call sites to find the exact field/branch the game checks for "tracking locked". Most work but removes all guesswork.
 
-See **PROJECT.md** for full technical details, build instructions, and complete recon data.
+## Branch state
+
+- **`hybrid-hle-override`** — recon trampoline + Step 2 Experiment 1 (in progress). 5 commits ahead of remote, ready to push.
+- `master` — Vita3K baseline.
+- `invizimals-ar-patches` — Atrac9 fix + motion system (the working patches).
+
+See **PROJECT.md** for full technical details, build instructions, complete recon data, and the Step 2 experiment log.

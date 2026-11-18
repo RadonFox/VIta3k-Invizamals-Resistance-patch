@@ -232,8 +232,9 @@ Currently LLE writes 1 (INITIALIZING) because SLAM never solves. +0x20=0x8000000
 is a "pose invalid" flag (bit 31). Forcing +0x08=2 and +0x20=0 should make the
 game see "tracking locked" and spawn objects.
 
-**Experiment 1 (building):** In the `PropagateResult` trampoline's host handler
-(`dump_propagate_result`), after LLE has already run, overwrite the prop buffer:
+**Experiment 1 (DONE — DID NOT WORK):** In the `PropagateResult` trampoline's host
+handler (`dump_propagate_result`), after LLE has already run, overwrite the prop
+buffer:
 - `+0x08`: 1 → 2 (force STATE_NORMAL / tracking locked)
 - `+0x20`: 0x80000000 → 0 (clear "invalid" flag)
 
@@ -243,12 +244,26 @@ Keep all recon logging so we can observe whether:
   the fake state and tried to read landmarks)
 - the prop buffer's +0x08 stays at 2 across frames or gets reset by LLE/game
 
+**Experiment 1 result (2026-11-18):** Override applied on all 2,391
+PropagateResult calls. `GetLandmarkInfo` retval stayed **0x0** on every call (no
+behavior change). `GetInitializationPointInfo` count ranged 0-64 (color bar
+unchanged). User confirmed: let it sit to count-of-20, **nothing spawned, no
+visible change.**
+
+**Conclusion:** `prop` buffer `+0x08` is **NOT** the field the game checks for
+"tracking locked" (or +0x08 is not the state enum). The gate is elsewhere — most
+likely the game checks `GetLandmarkInfo` directly for non-empty landmark data,
+not a state enum in PropagateResult's buffer.
+
 If Experiment 1 doesn't spawn objects, next steps:
 - Experiment 2: also fake `GetLandmarkInfo` (retval=1 + fill 512-byte buffer with
   a minimal fake landmark — needs landmark struct layout, unknown; try position
   floats at origin)
 - Experiment 3: modify the `DispatchAndQuery` result struct instead (e.g.
   +0x1C=0x0DEADBEE → a "tracking" value, or fill the p04 pose buffer)
+- Experiment 4: disassemble the game binary around the GetLandmarkInfo /
+  DispatchAndQuery call sites to find the exact field/branch the game checks for
+  "tracking locked" (decisive but most work)
 
 **Open question:** which sub-struct (+0x04 or +0x10) holds the tracking state,
 and at what offset? Step 1b extends the dump to follow these pointers (128 bytes
@@ -363,46 +378,52 @@ cmd /c C:\Users\rianp\AppData\Local\Temp\opencode\build_wrapper.bat
 - Added SUMMARY.md (executive summary) and confirmed GPLv2 license is present (COPYING.txt)
 - **Current branch: `hybrid-hle-override`** — ready for the hybrid approach implementation
 
-### Session 3 (Recon trampoline — Step 1)
+### Session 3 (Recon trampoline → Step 2 Experiment 1)
 - Implemented guest-ARM trampoline that wraps LLE `sceSmartSceneMappingDispatchAndQuery` (NID 0xF10FDDD1) to capture the post-LLE `SceneMappingResult` struct contents
-- **Mechanism:** after `sceSysmoduleLoadModule(SCE_SYSMODULE_SMART)` loads LLE libsmart and `load_func_exports` re-patches the game's import stubs to call LLE directly, `install_smartar_recon_hook` rewrites those stubs to jump to a 12-instruction ARM trampoline. The trampoline calls the original LLE (preserving 2D detection / color bar), then traps to a host dump handler via a synthetic SVC stub (NID 0xDEAD0001). r4–r6 preserved via push/pop (AAPCS).
-- Dump handler in `call_import` logs 96 bytes of the result struct (first 5 frames + every 60th) with frame counter and r0 (LLE return value)
-- **Files added:** `vita3k/modules/SceSmart/smartar_recon.h`, `vita3k/modules/SceSmart/smartar_recon.cpp`
+- **Bug fixed:** game loads `libsmart.suprx` from `app0:sce_module/` via `load_module` — NOT via `sceSysmoduleLoadModule(SCE_SYSMODULE_SMART)`. Moved the hook trigger from SceSysmodule into `load_module` (gated on path containing "libsmart"). Added idempotency guard.
+- Iteratively extended recon across 4 capture cycles to wrap all 7 game-called SmartAR functions and follow sub-struct pointers
+- **Complete recon picture (see `## SmartAR API Notes` → "Post-LLE capture"):**
+  - `DispatchAndQuery` result struct = static header (size, double-buffered data ptrs +0x04/+0x10, timestamp +0x08). p04 = pose output buffer (all zeros, never populated). p10 = camera image buffer. p18 = static config (flags=5).
+  - `GetInitializationPointInfo` retval = init-point count (0→28→3→42→57); buffer = float 2D pixel coords. Drives the color bar.
+  - `GetNumInitializationPoints` / `GetNumLandmarks` — **never called by the game** (not imported).
+  - `GetLandmarkInfo` — always retval=0, empty 512-byte buffer. **The "not locked" gate.**
+  - `PropagateResult` — retval=0 mostly; `prop` buffer static identity-ish pose (+0x08=1, +0x1C=1.0f, +0x20=0x80000000).
+- **Step 2 Experiment 1 (DID NOT WORK):** forced `prop+0x08=2` (STATE_NORMAL) + `prop+0x20=0` in the PropagateResult trampoline after LLE ran. Override applied on all 2,391 calls, but `GetLandmarkInfo` stayed 0 and nothing spawned. `prop+0x08` is not the gate the game checks.
+- **Files added:** `vita3k/modules/SceSmart/smartar_recon.{h,cpp}`
 - **Files modified:** `vita3k/modules/CMakeLists.txt`, `vita3k/modules/SceSysmodule/SceSysmodule.cpp`, `vita3k/modules/module_parent.cpp`
-- Build succeeded — `Vita3K.exe` produced
-- **Awaiting user test run:** launch Xtractor minigame, capture `vita3k.log`, paste the `SmartAR recon [frame ...]` lines so we can identify the tracking-state field and its "locked" value
+- Git: 5 commits on `hybrid-hle-override` (recon trampoline + 3 recon extensions + Step 2 exp1), ready to push
+- **Status: PAUSED for testing.** Next is Step 2 Experiment 2 (fake `GetLandmarkInfo` retval + buffer) or Experiment 4 (disassemble game binary to find the exact "tracking locked" check).
 
 ---
 
 ## Next Action
 
-**Step 1 — Capture LLE SmartAR's actual output (AWAITING USER TEST RUN):**
-The recon trampoline is built and installed. Next:
-1. Run `E:\Vita3K-src\build\windows-vs2022\bin\Release\Vita3K.exe`
-2. Get into the Xtractor shooting minigame (past face-confirm, wall detection, color-lock)
-3. Let it sit in the "sparks" state for ~10 seconds so the per-frame dump captures the progression
-4. Save `vita3k.log` and extract all `SmartAR recon [frame ...]` lines
-5. Compare struct contents across frames (color bar filling vs not) to identify:
-   - The tracking-state field (which word changes from "initializing" → "tracking" → "lost")
-   - The pose fields (position + orientation matrix)
-   - What value represents "tracking locked"
+**Step 2 — Hybrid HLE override (PAUSED — Experiment 1 failed, next is Experiment 2):**
 
-**Step 2 — Override the tracking state to "locked" (after Step 1 data):**
-Once we know which field is the tracking state and what "locked" looks like:
-1. Use `register_hle_override()` (taiHEN.cpp line 1299) to redirect `sceSmartSceneMappingDispatchAndQuery` (NID 0xF10FDDD1) to an HLE wrapper after libsmart loads
-2. The wrapper calls the original LLE function (for feature detection / color bar), then overwrites the tracking state field with "locked"
-3. May also need to fill pose fields (position + orientation) with a stable identity transform
-4. NOTE: the recon trampoline from Step 1 already proves the "call LLE then modify output" pattern works — Step 2 reuses the same trampoline approach but modifies the struct instead of (or in addition to) dumping it.
+Experiment 1 (force `prop+0x08=2` in PropagateResult) did not spawn objects.
+The game's "tracking locked" gate is NOT in the `prop` buffer state enum. Most
+likely the game checks `GetLandmarkInfo` for non-empty landmark data directly.
 
-**Step 3 — Test and iterate:**
-Run the Xtractor minigame, see if objects spawn. Adjust fake data as needed.
+**Next experiment (Experiment 2):** Fake `GetLandmarkInfo`:
+1. In the `GetLandmarkInfo` trampoline's host handler, after LLE runs (returns
+   0 with empty buffer), overwrite retval to non-zero AND fill the 512-byte
+   buffer with a minimal fake landmark.
+2. Unknown: the landmark struct layout. SmartAR landmarks are 3D map points
+   (position + descriptor + quality). Try: position floats (0,0,0) at +0x00,
+   a "valid" flag, and zeros elsewhere. Risk: wrong layout → crash or no effect.
+3. If the game iterates landmarks by index, may need to fake index 0 only and
+   return an "end" error for index 1+.
+
+**Decisive fallback (Experiment 4):** Disassemble the game binary around the
+`GetLandmarkInfo` / `DispatchAndQuery` call sites (using the capstone disassembler
+already in Vita3K, or a standalone tool) to find the exact field/branch the game
+checks for "tracking locked". This is the most work but removes all guesswork.
 
 **Key files for this work:**
-- `vita3k/modules/SceSmart/smartar_recon.cpp` — recon trampoline (Step 1, DONE) + future HLE override (Step 2)
-- `vita3k/modules/taiHEN/taiHEN.cpp` — `register_hle_override()` at line 1299
+- `vita3k/modules/SceSmart/smartar_recon.cpp` — recon trampolines + Step 2 override host handlers
+- `vita3k/modules/taiHEN/taiHEN.cpp` — `register_hle_override()` at line 1299 (alternate override mechanism)
 - `vita3k/modules/SceSmart/SceSmart.cpp` — HLE stubs (currently original UNIMPLEMENTED)
-- `vita3k/module/src/load_module.cpp` — module loading, auto_lle_modules list
-- `vita3k/modules/module_parent.cpp` — `call_import` (dump NID special case) + HLE/LLE path check (line 204)
+- `vita3k/modules/module_parent.cpp` — `call_import` (recon NID dispatch) + `load_module` (hook trigger)
 - `vita3k/kernel/src/load_self.cpp` — export_nids registration + import stub re-patching (line 278)
 
 ---
