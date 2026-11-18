@@ -237,7 +237,7 @@ cmd /c C:\Users\rianp\AppData\Local\Temp\opencode\build_wrapper.bat
 - User confirmed: keeping webcam+controller still, and moving them together, both don't work
 - User confirmed: AR objects follow camera (not world-anchored) — confirms no 6DOF pose
 
-### Session 2 (Phase 0 + 0.5)
+### Session 2 (Phase 0 + 0.5 + git setup)
 - Phase 0: forced HLE for SmartAR via auto_lle_modules removal + app0 path check fix
 - **Result: HLE stubs break color detection. Full HLE not viable.**
 - Key finding: game uses SceneMapping (SLAM), not TargetTracking. 7 functions identified with NIDs.
@@ -250,20 +250,36 @@ cmd /c C:\Users\rianp\AppData\Local\Temp\opencode\build_wrapper.bat
   - sceSmartSceneMappingGetLandmarkInfo(Ptr out, int size=512, Ptr ctx, int index)
 - Reverted all experimental changes (load_module.cpp, module_parent.cpp, SceSmart.cpp back to original)
 - Only working patches remain: Atrac9 fix + motion system (11 files)
-- Next: set up git repo, then hybrid approach (LLE detection + HLE tracking state override)
+- Git repo created: https://github.com/RadonFox/VIta3k-Invizamals-Resistance-patch (private)
+- Pushed 3 branches: `master` (baseline), `invizimals-ar-patches` (working patches + docs), `hybrid-hle-override` (next step, empty)
+- Added SUMMARY.md (executive summary) and confirmed GPLv2 license is present (COPYING.txt)
+- **Current branch: `hybrid-hle-override`** — ready for the hybrid approach implementation
 
 ---
 
 ## Next Action
 
-**Git repo setup (in progress):**
-1. Commit working patches + PROJECT.md to a new branch
-2. Create private GitHub repo
-3. Push and invite collaborator
+**Step 1 — Capture LLE SmartAR's actual output (the key unknown):**
+We need to see what the LLE `sceSmartSceneMappingDispatchAndQuery` writes into its result struct when the color bar fills (but tracking hasn't locked). This tells us which fields change and what the "not yet locked" tracking state value is. Approach:
+1. Keep LLE libsmart (reverted to original — already done)
+2. Add a host-side hook that, after `sceSmartSceneMappingDispatchAndQuery` returns, dumps the result struct at r1
+3. This requires either:
+   - A guest-level return hook (taiHEN-style "after" hook), OR
+   - An HLE wrapper that calls the original LLE function then dumps/modify the output
+4. Compare the struct contents across frames to identify the tracking state field
 
-**Then — Hybrid approach (Phase 1):**
-1. Keep LLE libsmart (feature detection works — color bar fills)
-2. Use `register_hle_override()` from taiHEN.cpp to redirect specific LLE SmartAR exports to HLE after libsmart loads
-3. Override `sceSmartSceneMappingDispatchAndQuery` to fill the result struct at r1 with "tracking locked" state
-4. Need to determine: which field in the 64-byte SceneMappingResult is the tracking state, and what value = "locked"
-5. May need to run LLE first, then patch the result (call original, modify output) — requires a hook-after mechanism
+**Step 2 — Override the tracking state to "locked":**
+Once we know which field is the tracking state and what "locked" looks like:
+1. Use `register_hle_override()` (taiHEN.cpp line 1299) to redirect `sceSmartSceneMappingDispatchAndQuery` (NID 0xF10FDDD1) to an HLE wrapper after libsmart loads
+2. The wrapper calls the original LLE function (for feature detection / color bar), then overwrites the tracking state field with "locked"
+3. May also need to fill pose fields (position + orientation) with a stable identity transform
+
+**Step 3 — Test and iterate:**
+Run the Xtractor minigame, see if objects spawn. Adjust fake data as needed.
+
+**Key files for this work:**
+- `vita3k/modules/taiHEN/taiHEN.cpp` — `register_hle_override()` at line 1299
+- `vita3k/modules/SceSmart/SceSmart.cpp` — HLE stubs (currently original UNIMPLEMENTED)
+- `vita3k/module/src/load_module.cpp` — module loading, auto_lle_modules list
+- `vita3k/modules/module_parent.cpp` — HLE/LLE path check (line 204)
+- `vita3k/kernel/src/load_self.cpp` — export_nids registration (for understanding the hook mechanism)
