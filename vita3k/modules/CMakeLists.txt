@@ -175,6 +175,7 @@ set(SOURCE_LIST
 	SceShellSvc/SceShellUtilLaunchApp.cpp
 	SceShutterSound/SceShutterSound.cpp
 	SceSmart/SceSmart.cpp
+	SceSmart/smartar_recon.cpp
 	SceSqlite/SceSqlite.cpp
 	SceSsl/SceSsl.cpp
 	SceSsl/SceSslInternal.cpp

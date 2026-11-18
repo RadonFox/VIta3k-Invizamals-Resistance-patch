@@ -66,6 +66,8 @@ Replace the LLE `libsmart.suprx` with an HLE implementation that stubs/forces th
 - [ ] Build and run to capture function signatures
 - [ ] Infer struct layouts from logged args
 - [ ] Document findings in `## SmartAR API Notes`
+- [x] **Recon trampoline installed (Step 1):** wraps LLE `sceSmartSceneMappingDispatchAndQuery` to dump the 96-byte result struct post-LLE. See `## Recon Trampoline (Step 1)` below.
+- [ ] Run Xtractor minigame, capture log, identify tracking-state field + "locked" value
 
 ### Phase 1 — Implement hybrid HLE overrides
 Vita3K has `register_hle_override()` in `vita3k/modules/taiHEN/taiHEN.cpp` (line 1299) that creates SVC stubs to redirect LLE exports to HLE functions. This is the mechanism for the hybrid approach:
@@ -255,31 +257,85 @@ cmd /c C:\Users\rianp\AppData\Local\Temp\opencode\build_wrapper.bat
 - Added SUMMARY.md (executive summary) and confirmed GPLv2 license is present (COPYING.txt)
 - **Current branch: `hybrid-hle-override`** — ready for the hybrid approach implementation
 
+### Session 3 (Recon trampoline — Step 1)
+- Implemented guest-ARM trampoline that wraps LLE `sceSmartSceneMappingDispatchAndQuery` (NID 0xF10FDDD1) to capture the post-LLE `SceneMappingResult` struct contents
+- **Mechanism:** after `sceSysmoduleLoadModule(SCE_SYSMODULE_SMART)` loads LLE libsmart and `load_func_exports` re-patches the game's import stubs to call LLE directly, `install_smartar_recon_hook` rewrites those stubs to jump to a 12-instruction ARM trampoline. The trampoline calls the original LLE (preserving 2D detection / color bar), then traps to a host dump handler via a synthetic SVC stub (NID 0xDEAD0001). r4–r6 preserved via push/pop (AAPCS).
+- Dump handler in `call_import` logs 96 bytes of the result struct (first 5 frames + every 60th) with frame counter and r0 (LLE return value)
+- **Files added:** `vita3k/modules/SceSmart/smartar_recon.h`, `vita3k/modules/SceSmart/smartar_recon.cpp`
+- **Files modified:** `vita3k/modules/CMakeLists.txt`, `vita3k/modules/SceSysmodule/SceSysmodule.cpp`, `vita3k/modules/module_parent.cpp`
+- Build succeeded — `Vita3K.exe` produced
+- **Awaiting user test run:** launch Xtractor minigame, capture `vita3k.log`, paste the `SmartAR recon [frame ...]` lines so we can identify the tracking-state field and its "locked" value
+
 ---
 
 ## Next Action
 
-**Step 1 — Capture LLE SmartAR's actual output (the key unknown):**
-We need to see what the LLE `sceSmartSceneMappingDispatchAndQuery` writes into its result struct when the color bar fills (but tracking hasn't locked). This tells us which fields change and what the "not yet locked" tracking state value is. Approach:
-1. Keep LLE libsmart (reverted to original — already done)
-2. Add a host-side hook that, after `sceSmartSceneMappingDispatchAndQuery` returns, dumps the result struct at r1
-3. This requires either:
-   - A guest-level return hook (taiHEN-style "after" hook), OR
-   - An HLE wrapper that calls the original LLE function then dumps/modify the output
-4. Compare the struct contents across frames to identify the tracking state field
+**Step 1 — Capture LLE SmartAR's actual output (AWAITING USER TEST RUN):**
+The recon trampoline is built and installed. Next:
+1. Run `E:\Vita3K-src\build\windows-vs2022\bin\Release\Vita3K.exe`
+2. Get into the Xtractor shooting minigame (past face-confirm, wall detection, color-lock)
+3. Let it sit in the "sparks" state for ~10 seconds so the per-frame dump captures the progression
+4. Save `vita3k.log` and extract all `SmartAR recon [frame ...]` lines
+5. Compare struct contents across frames (color bar filling vs not) to identify:
+   - The tracking-state field (which word changes from "initializing" → "tracking" → "lost")
+   - The pose fields (position + orientation matrix)
+   - What value represents "tracking locked"
 
-**Step 2 — Override the tracking state to "locked":**
+**Step 2 — Override the tracking state to "locked" (after Step 1 data):**
 Once we know which field is the tracking state and what "locked" looks like:
 1. Use `register_hle_override()` (taiHEN.cpp line 1299) to redirect `sceSmartSceneMappingDispatchAndQuery` (NID 0xF10FDDD1) to an HLE wrapper after libsmart loads
 2. The wrapper calls the original LLE function (for feature detection / color bar), then overwrites the tracking state field with "locked"
 3. May also need to fill pose fields (position + orientation) with a stable identity transform
+4. NOTE: the recon trampoline from Step 1 already proves the "call LLE then modify output" pattern works — Step 2 reuses the same trampoline approach but modifies the struct instead of (or in addition to) dumping it.
 
 **Step 3 — Test and iterate:**
 Run the Xtractor minigame, see if objects spawn. Adjust fake data as needed.
 
 **Key files for this work:**
+- `vita3k/modules/SceSmart/smartar_recon.cpp` — recon trampoline (Step 1, DONE) + future HLE override (Step 2)
 - `vita3k/modules/taiHEN/taiHEN.cpp` — `register_hle_override()` at line 1299
 - `vita3k/modules/SceSmart/SceSmart.cpp` — HLE stubs (currently original UNIMPLEMENTED)
 - `vita3k/module/src/load_module.cpp` — module loading, auto_lle_modules list
-- `vita3k/modules/module_parent.cpp` — HLE/LLE path check (line 204)
-- `vita3k/kernel/src/load_self.cpp` — export_nids registration (for understanding the hook mechanism)
+- `vita3k/modules/module_parent.cpp` — `call_import` (dump NID special case) + HLE/LLE path check (line 204)
+- `vita3k/kernel/src/load_self.cpp` — export_nids registration + import stub re-patching (line 278)
+
+---
+
+## Recon Trampoline (Step 1)
+
+**Goal:** See what LLE libsmart writes into the `SceneMappingResult` struct each frame, so we can identify the tracking-state field and its "locked" value.
+
+**Why a trampoline (not HLE override):** `register_hle_override` replaces the export with an SVC stub that runs HLE instead of LLE — LLE never runs, so 2D detection breaks. The trampoline calls the original LLE first (2D detection still works), then traps to the host to dump/modify the output.
+
+**How it works:**
+1. `sceSysmoduleLoadModule(SCE_SYSMODULE_SMART)` loads LLE libsmart. `load_func_exports` (load_self.cpp:278) rewrites the game's import stubs for NID 0xF10FDDD1 from SVC form to `MOVW/MOVT/BX r12 → LLE`.
+2. `install_smartar_recon_hook` (called right after) allocates:
+   - A 12-byte dump SVC stub: `svc #0; mov pc, lr; 0xDEAD0001`
+   - A 64-byte ARM trampoline (11 instructions + NOPs)
+3. It re-patches every game import stub that currently targets the LLE address to target the trampoline instead.
+4. Trampoline flow (AAPCS-correct, r4–r6 saved):
+   ```
+   push {r4-r6, lr}
+   mov  r4, r1          ; r4 = result ptr
+   movw/movt r12, lle   ; call original LLE
+   blx  r12
+   mov  r6, r0          ; save LLE return value
+   mov  r1, r4          ; r1 = result ptr for dump
+   movw/movt r12, dump  ; trap to host dump handler
+   blx  r12
+   mov  r0, r6          ; restore LLE return value
+   pop  {r4-r6, pc}     ; return to game
+   ```
+5. `call_import` (module_parent.cpp) special-cases NID 0xDEAD0001 → `smartar_recon_dump_result`, which logs 96 bytes of the struct at r1 (first 5 frames + every 60th).
+
+**Log output format:**
+```
+SmartAR recon: installed trampoline at ... wrapping LLE DispatchAndQuery at ... (dump SVC at ...); patched N import stub(s)
+SmartAR recon [frame 1] SceneMappingResult @ 0x... (r0=0x...)
+  +0x00: ...
+  +0x10: ...
+  +0x20: ...
+  +0x30: ...
+  +0x40: ...
+  +0x50: ...
+```

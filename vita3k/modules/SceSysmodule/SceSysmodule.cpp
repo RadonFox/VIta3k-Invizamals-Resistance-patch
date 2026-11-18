@@ -20,6 +20,7 @@
 #include <kernel/state.h>
 #include <module/load_module.h>
 #include <modules/module_parent.h>
+#include "../SceSmart/smartar_recon.h"
 #include <util/tracy.h>
 #include <util/vector_utils.h>
 
@@ -206,9 +207,16 @@ EXPORT(int, sceSysmoduleLoadModule, SceSysmoduleModuleId module_id) {
     if (is_module_loaded(emuenv.kernel, module_id))
         return SCE_SYSMODULE_LOADED;
     if (is_module_enabled(emuenv, module_id)) {
-        if (load_sys_module(emuenv, module_id))
+        if (load_sys_module(emuenv, module_id)) {
+            // SmartAR recon: after LLE libsmart loads and its exports are
+            // registered, wrap sceSmartSceneMappingDispatchAndQuery with a
+            // guest trampoline that dumps the SceneMappingResult struct.
+            // No-op for other modules and when libsmart is HLE.
+            if (module_id == SCE_SYSMODULE_SMART) {
+                install_smartar_recon_hook(emuenv);
+            }
             return SCE_SYSMODULE_LOADED;
-        else
+        } else
             return RET_ERROR(SCE_SYSMODULE_ERROR_FATAL);
     } else {
         std::lock_guard<std::mutex> guard(emuenv.kernel.mutex);

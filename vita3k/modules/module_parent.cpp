@@ -36,6 +36,8 @@
 #include <util/log.h>
 #include <util/string_utils.h>
 
+#include "SceSmart/smartar_recon.h"
+
 #include <unordered_set>
 
 static constexpr bool LOG_UNK_NIDS_ALWAYS = false;
@@ -149,6 +151,14 @@ static void log_import_call(char emulation_level, uint32_t nid, SceUID thread_id
 }
 
 CallResult call_import(EmuEnvState &emuenv, CPUState &cpu, uint32_t nid, SceUID thread_id) {
+    // SmartAR recon dump stub: the guest trampoline calls the original LLE
+    // sceSmartSceneMappingDispatchAndQuery, then traps here via a synthetic
+    // SVC stub so we can log the contents of the result struct at r1.
+    if (nid == SMARTAR_RECON_DUMP_NID) {
+        smartar_recon_dump_result(emuenv, cpu);
+        return { .regs = { 0 }, .count = 1 };
+    }
+
     // HLE - call our C++ function
     if (emuenv.kernel.debugger.watch_import_calls) {
         const std::unordered_set<uint32_t> hle_nid_blacklist = {
