@@ -310,7 +310,17 @@ SceUID load_module(EmuEnvState &emuenv, const std::string &module_path) {
         return SCE_ERROR_ERRNO_ENOENT;
     }
 
-    return load_module_data(module_buffer.data());
+    const SceUID module_id = load_module_data(module_buffer.data());
+    // SmartAR recon: after LLE libsmart loads and its exports are registered
+    // (which re-patches the game's import stubs to call LLE directly), wrap
+    // sceSmartSceneMappingDispatchAndQuery with a guest trampoline that dumps
+    // the SceneMappingResult struct. Idempotent. The game loads libsmart from
+    // app0:sce_module/ rather than via sceSysmoduleLoadModule, so this is the
+    // path that actually fires.
+    if (module_id >= 0 && module_path.find("libsmart") != std::string::npos) {
+        install_smartar_recon_hook(emuenv);
+    }
+    return module_id;
 }
 
 int unload_module(EmuEnvState &emuenv, SceUID module_id) {

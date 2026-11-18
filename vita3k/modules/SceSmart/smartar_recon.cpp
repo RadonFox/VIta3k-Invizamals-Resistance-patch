@@ -62,6 +62,12 @@ static void write_branch_stub(uint32_t *dest, Address target) {
 }
 
 void install_smartar_recon_hook(EmuEnvState &emuenv) {
+    static bool installed = false; // idempotent: safe to call from multiple load paths
+    if (installed) {
+        LOG_DEBUG("SmartAR recon: hook already installed, skipping");
+        return;
+    }
+
     auto &kernel = emuenv.kernel;
     auto &mem = emuenv.mem;
 
@@ -175,16 +181,17 @@ void install_smartar_recon_hook(EmuEnvState &emuenv) {
     LOG_INFO("SmartAR recon: installed trampoline at {} wrapping LLE DispatchAndQuery "
              "at {} (dump SVC at {}); patched {} import stub(s)",
         log_hex(trampoline_addr), log_hex(lle_addr), log_hex(dump_stub_addr), patched);
+    installed = true;
 }
 
 void smartar_recon_dump_result(EmuEnvState &emuenv, CPUState &cpu) {
-    // Throttle: log the first 5 frames, then every 60th, so we capture the
-    // "color bar filling -> tracking attempting -> locked" progression without
-    // flooding the log.
+    // Throttle: log the first 20 frames densely (to catch the idle -> color bar
+    // filling -> locked transition), then every 30th, so we capture the
+    // progression without flooding the log.
     static uint32_t frame = 0;
     static uint32_t logged = 0;
     ++frame;
-    const bool do_log = (logged < 5) || (frame % 60 == 0);
+    const bool do_log = (logged < 20) || (frame % 30 == 0);
     if (!do_log)
         return;
 
@@ -194,23 +201,44 @@ void smartar_recon_dump_result(EmuEnvState &emuenv, CPUState &cpu) {
         return;
     }
 
-    constexpr size_t DUMP_BYTES = 96; // 64-byte struct + 32 extra to find trailing fields
-    const uint8_t *data = Ptr<uint8_t>(result_ptr).get(emuenv.mem);
-    if (!data) {
-        LOG_INFO("SmartAR recon [frame {}]: result ptr {} maps to no host memory",
-            frame, log_hex(result_ptr));
-        return;
-    }
+    auto dump_region = [&emuenv](Address addr, size_t bytes, const char *label) {
+        if (addr == 0) {
+            LOG_INFO("  {}: <null pointer>", label);
+            return;
+        }
+        const uint8_t *data = Ptr<uint8_t>(addr).get(emuenv.mem);
+        if (!data) {
+            LOG_INFO("  {}: ptr {} maps to no host memory", label, log_hex(addr));
+            return;
+        }
+        for (size_t off = 0; off < bytes; off += 16) {
+            uint32_t words[4] = {};
+            std::memcpy(words, data + off, sizeof(words));
+            LOG_INFO("  {} +0x{:02x}: {:08X} {:08X} {:08X} {:08X}",
+                label, off, words[0], words[1], words[2], words[3]);
+        }
+    };
 
     LOG_INFO("SmartAR recon [frame {}] SceneMappingResult @ {} (r0={})",
         frame, log_hex(result_ptr), log_hex(cpu.get_reg(0)));
-    for (size_t off = 0; off < DUMP_BYTES; off += 16) {
-        // 16 bytes per line as 4 little-endian uint32 words with struct offset.
-        // memcpy keeps this well-defined regardless of host pointer alignment.
-        uint32_t words[4] = {};
-        std::memcpy(words, data + off, sizeof(words));
-        LOG_INFO("  +0x{:02x}: {:08X} {:08X} {:08X} {:08X}",
-            off, words[0], words[1], words[2], words[3]);
+
+    // Main struct (64 bytes per +0x00 size field)
+    dump_region(result_ptr, 64, "main");
+
+    // Follow the double-buffered data pointers. The actual tracking state +
+    // pose live in the structures these point to.
+    const uint8_t *base = Ptr<uint8_t>(result_ptr).get(emuenv.mem);
+    if (base) {
+        uint32_t p04 = 0, p10 = 0, p18 = 0;
+        std::memcpy(&p04, base + 0x04, 4);
+        std::memcpy(&p10, base + 0x10, 4);
+        std::memcpy(&p18, base + 0x18, 4);
+        dump_region(p04, 128, "p04");
+        dump_region(p10, 128, "p10");
+        // +0x18 is a constant pointer across frames; dump once in a while to
+        // see if it's a config/static-state struct.
+        if (logged < 5 || frame % 300 == 0)
+            dump_region(p18, 128, "p18");
     }
     ++logged;
 }

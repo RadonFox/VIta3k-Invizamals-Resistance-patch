@@ -149,6 +149,43 @@ SceneMappingResult (64+ bytes, pre-filled 0xDEADBEEF):
 // r0 = output ptr, r1 = 0x200 (512 bytes), r2 = context ptr, r3 = index
 ```
 
+### Post-LLE capture (Session 3, Step 1) — ACTUAL struct contents
+
+Captured 22,200 frames (~6 min) with the recon trampoline while the game sat in
+the Xtractor "sparks" state (color locked, 6DOF tracking not achieved). The
+64-byte result struct at r1 (fixed addr `0x8099DF98`) is **essentially static**;
+only 3 fields change:
+
+| Offset | Field | Behavior |
+|--------|-------|----------|
+| +0x00 | size | `0x00000040` (64) constant |
+| **+0x04** | **data ptr A/B** | Alternates `0x824040B0` ↔ `0x824050C8` — double-buffered pointer to per-frame data |
+| **+0x08** | **timestamp (us)** | Monotonic 0 → 0x0977A554, increments ~16666 (1/60s) |
+| +0x0C | ? | `0` constant |
+| **+0x10** | **state/tracking ptr A/B** | Alternates `0x8E398FA0` ↔ `0x8E3E3FB0`, in lockstep with +0x04 |
+| +0x14 | (uninit) | `0xCCCCCCCC` constant |
+| +0x18 | ptr | `0x824050B0` constant |
+| +0x1C | ? | `0x0DEADBEE` constant (NOT the 0xDEADBEEF sentinel — LLE wrote this) |
+| +0x20 | (uninit) | `0xCCCCCCCC` constant |
+| +0x24, +0x28 | ? | `0` constant |
+| +0x2C–0x48 | sentinels | `0xDEADBEEF` constant |
+| +0x4C | ptr | `0x814FC0B1` constant |
+| +0x50 | sentinel | `0xDEADBEEF` constant |
+| +0x54 | ?/flags | `0x80001001` constant |
+| +0x58 | ptr | `0x82404090` constant |
+| +0x5C | (uninit) | `0xCCCCCCCC` constant |
+
+**Key finding: the tracking state + pose are NOT in this 64-byte wrapper struct.**
+They live in the sub-structures pointed to by **+0x04** and **+0x10** (which
+alternate in lockstep — classic double-buffering: LLE writes buffer A while the
+game reads buffer B, then swaps). The wrapper is just a header (size, two
+double-buffered data pointers, timestamp).
+
+**Open question:** which sub-struct (+0x04 or +0x10) holds the tracking state,
+and at what offset? Step 1b extends the dump to follow these pointers (128 bytes
+each) and captures the **idle → color-bar-filling → locked transition** (the
+Session 3 capture was steady-state only, so no state field visibly transitioned).
+
 ### What we still don't know
 - Which field in SceneMappingResult is the tracking state enum (not tracking / initializing / tracking / lost)
 - Which fields are the pose (position + orientation matrix)
