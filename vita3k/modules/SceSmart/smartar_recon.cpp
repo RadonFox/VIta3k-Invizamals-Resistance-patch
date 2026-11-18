@@ -305,14 +305,44 @@ static void dump_landmark_info(EmuEnvState &emuenv, CPUState &cpu) {
 }
 
 // PropagateResult: entry r0 = result/state ptr (we dump 64 bytes at it).
+//
+// Step 2 experiment: after LLE runs, MODIFY the prop buffer to fake
+// "tracking locked", then log. The prop buffer is constant across all phases
+// at +0x08=1, +0x0C=1, +0x1C=1.0f, +0x20=0x80000000. Hypothesis (from Sony
+// SmartAR SceSmartSceneMappingState: 0=NOT_INITIALIZED, 1=INITIALIZING,
+// 2=NORMAL/tracking-locked, 3=LOST): +0x08 is the state enum, currently 1
+// (INITIALIZING). We force it to 2 (NORMAL). +0x20=0x80000000 looks like an
+// "invalid" flag (bit 31 set), so we clear it to 0.
 static void dump_propagate_result(EmuEnvState &emuenv, CPUState &cpu) {
     const Address state_ptr = cpu.get_reg(0); // entry r0
     const uint32_t arg1 = cpu.get_reg(1); // entry r1
     const uint32_t retval = cpu.get_reg(2); // LLE retval
-    LOG_INFO("SmartAR recon [frame {}] PropagateResult retval={} state@={} arg1={}",
-        frame, log_hex(retval), log_hex(state_ptr), log_hex(arg1));
-    if (state_ptr)
-        dump_hex(emuenv, state_ptr, 64, "prop");
+
+    // --- Step 2: fake "tracking locked" in the prop buffer (host-side write
+    // after LLE already ran in the trampoline). The game reads this buffer
+    // after PropagateResult returns, so it will see our modified values. ---
+    if (state_ptr) {
+        uint8_t *prop = Ptr<uint8_t>(state_ptr).get(emuenv.mem);
+        if (prop) {
+            auto set32 = [&](size_t off, uint32_t v) {
+                std::memcpy(prop + off, &v, 4);
+            };
+            const uint32_t orig_state = *reinterpret_cast<const uint32_t *>(prop + 0x08);
+            const uint32_t orig_flag = *reinterpret_cast<const uint32_t *>(prop + 0x20);
+            set32(0x08, 2u); // state: INITIALIZING(1) -> NORMAL(2) (tracking locked)
+            set32(0x20, 0u); // clear "invalid" flag (bit 31)
+            LOG_INFO("SmartAR recon [frame {}] PropagateResult retval={} state@={} arg1={} "
+                     "OVERRODE +0x08: {}->2 (STATE_NORMAL), +0x20: {}->0",
+                frame, log_hex(retval), log_hex(state_ptr), log_hex(arg1),
+                orig_state, log_hex(orig_flag));
+        } else {
+            LOG_INFO("SmartAR recon [frame {}] PropagateResult retval={} state@={} (unmapped)",
+                frame, log_hex(retval), log_hex(state_ptr));
+        }
+    } else {
+        LOG_INFO("SmartAR recon [frame {}] PropagateResult retval={} state@=<null> arg1={}",
+            frame, log_hex(retval), log_hex(arg1));
+    }
 }
 
 void smartar_recon_dump_result(EmuEnvState &emuenv, CPUState &cpu, uint32_t log_nid) {

@@ -208,6 +208,48 @@ appear → game stays in sparks. The hybrid HLE override (Step 2) likely needs t
 fake `GetLandmarkInfo` to return a valid landmark + pose, possibly also filling
 the p04 pose buffer via `DispatchAndQuery`'s result.
 
+**Session 3d capture (wrapped GetLandmarkInfo + PropagateResult):**
+- `GetLandmarkInfo` (0xB17057EA): called 14,323 times. **retval is ALWAYS 0x0
+  with an all-zero 512-byte buffer.** SLAM never produces landmarks. This is the
+  "not locked" gate — the game polls this every frame and always gets nothing.
+- `PropagateResult` (0x5A9EC64D): called 2,329 times. retval=0 (success) most
+  frames, occasionally 0x808C0005. arg1=0x1E (30) constant. state@ (r0) is a
+  double-buffered pointer (0x82409030 / 0x824060D8). The 64-byte `prop` buffer is
+  **static across all phases** (only +0x00 timestamp changes):
+  ```
+  +0x00: timestamp (increasing)        +0x04: 0
+  +0x08: 1  <-- candidate state enum    +0x0C: 1
+  +0x10: 0  +0x14: 0  +0x18: 0
+  +0x1C: 3F800000 (1.0f)               +0x20: 80000000 (candidate "invalid" flag)
+  +0x24-0x3C: 0
+  ```
+
+### Step 2 — hybrid HLE override (IN PROGRESS)
+
+**Hypothesis:** `prop` buffer +0x08 is `SceSmartSceneMappingState`
+(0=NOT_INITIALIZED, 1=INITIALIZING, **2=NORMAL/tracking-locked**, 3=LOST).
+Currently LLE writes 1 (INITIALIZING) because SLAM never solves. +0x20=0x80000000
+is a "pose invalid" flag (bit 31). Forcing +0x08=2 and +0x20=0 should make the
+game see "tracking locked" and spawn objects.
+
+**Experiment 1 (building):** In the `PropagateResult` trampoline's host handler
+(`dump_propagate_result`), after LLE has already run, overwrite the prop buffer:
+- `+0x08`: 1 → 2 (force STATE_NORMAL / tracking locked)
+- `+0x20`: 0x80000000 → 0 (clear "invalid" flag)
+
+Keep all recon logging so we can observe whether:
+- objects spawn (user reports)
+- `GetLandmarkInfo` starts returning non-zero (would indicate the game accepted
+  the fake state and tried to read landmarks)
+- the prop buffer's +0x08 stays at 2 across frames or gets reset by LLE/game
+
+If Experiment 1 doesn't spawn objects, next steps:
+- Experiment 2: also fake `GetLandmarkInfo` (retval=1 + fill 512-byte buffer with
+  a minimal fake landmark — needs landmark struct layout, unknown; try position
+  floats at origin)
+- Experiment 3: modify the `DispatchAndQuery` result struct instead (e.g.
+  +0x1C=0x0DEADBEE → a "tracking" value, or fill the p04 pose buffer)
+
 **Open question:** which sub-struct (+0x04 or +0x10) holds the tracking state,
 and at what offset? Step 1b extends the dump to follow these pointers (128 bytes
 each) and captures the **idle → color-bar-filling → locked transition** (the
