@@ -1292,11 +1292,12 @@ void load_taihen_config(EmuEnvState &emuenv) {
     }
 }
 
-// Register an HLE override for a kubridge export NID.
+// Register an HLE override for an LLE export NID (kubridge plugin exports, SmartAR, ...).
 // Creates an SVC stub in ARM memory, overwrites export_nids, and re-patches
 // any existing func_binding_infos so that callers dispatch to HLE C++ instead
-// of kubridge's ARM code (which uses firmware-specific offsets and MMU ops).
-static void register_hle_override(EmuEnvState &emuenv, uint32_t nid) {
+// of the module's ARM code. Returns the original LLE address (0 on failure or
+// if the NID had no export) so the HLE side can still call the original.
+Address register_hle_override(EmuEnvState &emuenv, uint32_t nid) {
     auto &kernel = emuenv.kernel;
     auto &mem = emuenv.mem;
     const std::lock_guard<std::mutex> guard(kernel.export_nids_mutex);
@@ -1305,7 +1306,7 @@ static void register_hle_override(EmuEnvState &emuenv, uint32_t nid) {
     Address stub_addr = alloc(mem, 12, "kubridge_hle_override");
     if (!stub_addr) {
         LOG_ERROR("register_hle_override: failed to allocate stub for NID {}", log_hex(nid));
-        return;
+        return 0;
     }
 
     uint32_t *stub = Ptr<uint32_t>(stub_addr).get(mem);
@@ -1333,6 +1334,7 @@ static void register_hle_override(EmuEnvState &emuenv, uint32_t nid) {
 
     const char *name = import_name(nid);
     LOG_INFO("taiHEN: registered HLE override for NID {} ({}) at {}", log_hex(nid), name, log_hex(stub_addr));
+    return lle_addr;
 }
 
 // Apply HLE overrides for plugin exports that have HLE implementations.

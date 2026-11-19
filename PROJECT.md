@@ -83,6 +83,43 @@ Vita3K has `register_hle_override()` in `vita3k/modules/taiHEN/taiHEN.cpp` (line
 | `sceSmartTargetTrackingRegisterTarget` | Register fake target, return 0 |
 | `sceSmartTargetTrackingStart` | Return 0 |
 | `sceSmartTargetTrackingRun` / `Run2` / `RunWorker` | Return 0 (per-frame update) |
+**Implemented on branch `claude/smartar-hybrid-override`:**
+- `register_hle_override()` (taiHEN.cpp) is now public and returns the original LLE address.
+- `load_module()` (module_parent.cpp) calls `install_smart_hybrid_overrides()` right after `libsmart.suprx` loads.
+- `sceSmartSceneMappingDispatchAndQuery` (SceSmart.cpp) is now an HLE wrapper: it calls the real LLE function via `ThreadState::call_guest()`, then logs the result struct (first call: full 0x100-byte dump; afterwards only the words that changed, as `+OFF:old->new`).
+- Experimental forcing without rebuilding: set env var `VITA3K_SMART_FORCE` to offset=value pairs before launching, e.g. `set VITA3K_SMART_FORCE=0x30=2,0x34=1` (cmd) — each pair overwrites that 32-bit word of the result after the LLE call.
+- How to use: see **Testing the SmartAR hybrid override** below.
+
+#### Testing the SmartAR hybrid override
+
+1. **Apply the patch / check out the branch**, then close Vita3K. A running `Vita3K.exe` locks the exe and the link step fails (LNK1104).
+2. **Build** (from a VS 2022 x64 developer prompt). If submodules aren't checked out yet, run `git submodule update --init --recursive` first.
+   ```
+   cmake --preset windows-vs2022
+   cmake --build build/windows-vs2022 --config Release
+   ```
+3. **Run once without forcing anything.** Launch `build\windows-vs2022\bin\Release\Vita3K.exe` and play up to the Xtractor minigame. Let the color bar fill, then press the button.
+4. **Read the log:** `vita3k.log` next to the exe. Look for:
+   - `SmartAR hybrid: wrapping ...` — the override is active
+   - `SmartAR DispatchAndQuery #N ... full dump:` — the first call, the whole 0x100-byte result
+   - `SmartAR DispatchAndQuery #N ... changed: +OFF:old->new` — words that changed since the previous call
+
+   Note which offsets change when the bar fills and when you press the button.
+5. **Try forcing a value.** Set the env var in the same window you launch from (`0x30=2` is only an example — use the offsets/values from step 4; several pairs are comma-separated):
+   ```
+   :: cmd
+   set VITA3K_SMART_FORCE=0x30=2
+   build\windows-vs2022\bin\Release\Vita3K.exe
+   ```
+   ```
+   # PowerShell
+   $env:VITA3K_SMART_FORCE="0x30=2"
+   .\build\windows-vs2022\bin\Release\Vita3K.exe
+   ```
+   The log confirms it with `SmartAR hybrid: will force result+0x30 = 0x2`. Offsets must be 4-aligned and below 0x100.
+
+**Troubleshooting:** if `SmartAR hybrid: wrapping ...` never appears, the game loaded libsmart some other way and the hook in `load_module()` (module_parent.cpp) needs moving. If you see `override not active`, libsmart is running as HLE — make sure `SCE_SYSMODULE_SMART` is still in `auto_lle_modules`.
+
 ### Phase 2 — Implement fake tracking results
 - [ ] Based on Phase 0.5 recon, implement HLE overrides for key functions
 - [ ] Test with hybrid approach (LLE detection + HLE tracking state)

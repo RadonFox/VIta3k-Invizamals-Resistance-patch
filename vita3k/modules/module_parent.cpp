@@ -250,6 +250,10 @@ SceUID load_module(EmuEnvState &emuenv, const std::string &module_path) {
         if (module_id >= 0) {
             const auto module = lock_and_find(module_id, emuenv.kernel.loaded_modules, emuenv.kernel.mutex);
             LOG_INFO("Module {} (at \"{}\") loaded", module->info.module_name, module_path);
+
+            // SmartAR hybrid: keep the real libsmart for 2D detection, wrap its tracking query in HLE.
+            if (fs::path(module_path).stem().string() == "libsmart")
+                install_smart_hybrid_overrides(emuenv);
         } else {
             LOG_ERROR("Failed to load module {}", module_path);
         }

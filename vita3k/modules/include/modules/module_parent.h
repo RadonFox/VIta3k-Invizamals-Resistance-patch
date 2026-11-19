@@ -57,5 +57,13 @@ bool load_sys_module_internal_with_arg(EmuEnvState &emuenv, SceSysmoduleInternal
 
 void load_taihen_plugins_for_title(EmuEnvState &emuenv, const std::string &titleid);
 
+// Redirects an LLE export NID to its HLE implementation from nids.inc (see taiHEN.cpp).
+// Returns the original LLE address, or 0 if there was none.
+Address register_hle_override(EmuEnvState &emuenv, uint32_t nid);
+
+// Hybrid SmartAR: once the real libsmart is loaded, route selected exports through HLE
+// wrappers that call the LLE original and then inspect/patch its output (see SceSmart.cpp).
+void install_smart_hybrid_overrides(EmuEnvState &emuenv);
+
 Ptr<void> create_vtable(const std::vector<uint32_t> &nids, MemState &mem);
 Ptr<void> get_client_vtable(KernelState &kernel, MemState &mem);
