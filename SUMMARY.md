@@ -2,7 +2,7 @@
 
 ## Project: Invizimals: The Resistance on Vita3K
 
-**Status:** Partially working — past face-confirm, wall detection, and camera color-lock. Blocked at the Xtractor shooting minigame (objects won't spawn). Recon of the SmartAR API is complete; first hybrid HLE override attempt did not work; next attempt planned.
+**Status:** Partially working — past face-confirm, wall detection, and camera color-lock. Blocked at the Xtractor shooting minigame (objects won't spawn). SmartAR internals fully disassembled; all hybrid HLE override faking approaches tried (Experiments 1, 2, 2c, 2d) failed against the fundamental limitation that LLE SLAM can't solve in the emulator. Next options documented in STRUCTURE.md.
 
 ---
 
@@ -40,18 +40,23 @@ A guest-ARM trampoline was built (`vita3k/modules/SceSmart/smartar_recon.cpp`) t
 
 The game polls `GetLandmarkInfo` every frame and always gets 0/empty → never sees "tracking locked" → sits in sparks.
 
-## Step 2 — hybrid HLE override (IN PROGRESS)
+## Step 2 — hybrid HLE override (STALLED — fundamental limitation hit)
 
-**Experiment 1 (DONE — did not work):** Forced `prop+0x08 = 2` (hypothesis: `SceSmartSceneMappingState` NORMAL/tracking-locked) and `prop+0x20 = 0` (clear "invalid" flag) in the `PropagateResult` trampoline after LLE ran. Override applied on all 2,391 calls, but `GetLandmarkInfo` stayed 0 and nothing spawned. The `prop` buffer state enum is **not** the gate the game checks.
+All faking approaches tried (Experiments 1, 2, 2c, 2d) failed:
 
-**Next (Experiment 2):** Fake `GetLandmarkInfo` — override retval to non-zero and fill the 512-byte buffer with a minimal fake landmark. Unknown: the landmark struct layout (SmartAR landmarks are 3D map points: position + descriptor + quality). Risk: wrong layout → crash or no effect.
+- **Exp 1** (force `prop+0x08=2`): state enum, no effect — Function A copies "pose" from stack but those are pointers (garbage), not real pose.
+- **Exp 2** (fake `GetLandmarkInfo` retval+buffer): no effect — the real gate is `[struct+0x2054]` bit0, not the landmark retval.
+- **Exp 2c** (set `+0x2054` bit0): `RunCore` IS called but it's LLE SLAM processing — runs but can't solve tracking in the emulator.
+- **Exp 2d** (fill result struct with identity pose): **CRASHED** — LLE `DispatchAndQuery` reads back the `+0x10` (p10 pointer) on the next call; overwriting with a float broke it.
 
-**Decisive fallback (Experiment 4):** Disassemble the game binary around the `GetLandmarkInfo` / `DispatchAndQuery` call sites to find the exact field/branch the game checks for "tracking locked". Most work but removes all guesswork.
+The fundamental problem: the LLE SLAM algorithm (`RunCore` + `DispatchAndQuery`) cannot produce a valid 6DOF pose in the emulator, and faking individual outputs doesn't work because the LLE code needs its internal data structures (pointers) to be consistent.
+
+Full disassembly findings, struct layouts, call flow, and remaining options are in **`STRUCTURE.md`**.
 
 ## Branch state
 
-- **`hybrid-hle-override`** — recon trampoline + Step 2 Experiment 1 (in progress). 5 commits ahead of remote, ready to push.
+- **`hybrid-hle-override`** — recon trampoline + Experiments 1/2/2c/2d + full disassembly. All faking approaches failed against the fundamental SLAM limitation. Unpushed.
 - `master` — Vita3K baseline.
 - `invizimals-ar-patches` — Atrac9 fix + motion system (the working patches).
 
-See **PROJECT.md** for full technical details, build instructions, complete recon data, and the Step 2 experiment log.
+See **PROJECT.md** for full technical details, build instructions, complete recon data, and the experiment log. See **STRUCTURE.md** for the SmartAR internal structure reference.

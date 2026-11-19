@@ -265,6 +265,108 @@ If Experiment 1 doesn't spawn objects, next steps:
   DispatchAndQuery call sites to find the exact field/branch the game checks for
   "tracking locked" (decisive but most work)
 
+### Step 2 — Experiment 4: disassembly findings (2026-11-19)
+
+Disassembled the game's SmartAR call sites using a capstone-based scanner
+(`disassemble_smartar_callsites` in `smartar_recon.cpp`). Found 8 call sites
+in Thumb mode, all in one function at `0x814FEE48` (the AR update function):
+
+| Address | Function | Key finding |
+|---------|----------|-------------|
+| 0x814FEE82 | sceSmartInit | init, called once |
+| 0x814FEE88 | SceneMappingStart | right after init |
+| 0x814FEB12 | PropagateResult | **game checks prop[+0x08]==2 after return** |
+| 0x814FEFA8 | DispatchAndQuery | retval IGNORED (game loads new r0 immediately) |
+| 0x814FEFC8 | GetInitializationPointInfo | retval (count) stored at struct+0x2090 |
+| 0x814FEFE8 | GetLandmarkInfo | retval stored at struct+0x794; **struct+0x54 bit 0 tested** |
+| 0x814FF05C | SceneMappingStart | state transition (state!=5 path) |
+| 0x814FF062 | SceneMappingReset | state transition |
+
+**The real "tracking locked" gate** (after GetLandmarkInfo at 0x814FEFE8):
+```
+0x814FEFFC str.w r0, [r1, #0x794]    ; store GetLandmarkInfo retval at struct+0x794
+0x814FF004 ldr.w sb, [r1, #0x54]     ; load struct+0x54
+0x814FF00C b   #0x814ff03a
+0x814FF03A ands sb, sb, #1           ; test bit 0 of struct+0x54
+0x814FF068 cmp.w sb, #0
+0x814FF06C beq #0x814ff072           ; if bit 0 == 0, SKIP critical call
+0x814FF06E blx #0x8185df64           ; called ONLY if struct+0x54 bit 0 is set
+```
+
+The output buffer for GetLandmarkInfo is at `struct_base + 0x2798`, so
+`struct_base = buf - 0x2798`. This lets us modify `struct+0x54` directly from
+the trampoline's dump handler.
+
+**Why Experiments 1 & 2 failed:**
+- Experiment 1 (prop+0x08=2): the pose-copy path WAS entered, but the pose
+  floats on the stack were empty (SLAM never produced a pose). The game copied
+  an all-zero/invalid pose. AND struct+0x54 bit 0 was never set.
+- Experiment 2 (fake GetLandmarkInfo retval+buffer): the retval was stored at
+  struct+0x794, but struct+0x54 bit 0 was never set, so the critical call at
+  0x8185df64 was always skipped.
+
+**Experiment 2c (current):** fake retval + buffer AND set struct+0x54 bit 0
+(via `struct_base = buf - 0x2798`). Also set struct+0x794=1. Combined with
+Experiment 1 (prop+0x08=2) still active. This should make BOTH gates pass:
+the pose-copy path (from prop+0x08=2) AND the critical function call (from
+struct+0x54 bit 0).
+
+**Hypothesis:** The game polls `GetLandmarkInfo` every frame and always gets
+retval=0 / empty buffer → never sees "tracking locked". If we fake a non-zero
+retval + a filled landmark buffer, the game should think SLAM has landmarks and
+proceed to spawn objects.
+
+**Implementation:**
+1. Extended the generic recon trampoline to also preserve entry r2→r7 and
+   r3→r8 (previously only r0/r1 were saved; LLE clobbers r0-r3). The dump
+   handler now receives r0=entry r0, r1=entry r1, r2=retval, r3=entry r3
+   (the landmark index for `GetLandmarkInfo`). Trampoline is now 80 bytes
+   (18 instrs); push/pop changed to `{r4-r8, lr}` / `{r4-r8, pc}`. The
+   "already wrapped" check was updated (`0xE92D4070` → `0xE92D41F0`).
+2. **Return-value override mechanism:** the trampoline's final `mov r0, r6`
+   runs *after* the SVC returns. `write_call_result` only overwrites r0, not
+   r6 — so a host handler calling `cpu.set_reg(6, newval)` changes the value
+   the game sees as the function's return value.
+3. `dump_landmark_info` now, when LLE returned retval=0 AND index==0 AND buf
+   is valid:
+   - Zeros the 512-byte buffer.
+   - Writes a minimal fake landmark: `+0x00` pos x=0.0f, `+0x04` pos y=0.0f,
+     `+0x08` pos z=1.0f (1m ahead), `+0x0C` quality=1.0f, `+0x10` valid/id=1,
+     `+0x18` secondary quality=1.0f. Rest zeros. (Exact
+     SceSmartLandmarkInfo layout unknown — best-guess fill.)
+   - Calls `cpu.set_reg(6, 1)` so the game sees retval=1 (one landmark).
+   - For index > 0: leaves retval=0 (LLE's "no more landmarks") so the game
+     stops iterating if it walks indices.
+4. The PropagateResult Experiment 1 override (`prop+0x08=2`, `prop+0x20=0`)
+   is still active — it was harmless (no effect) and keeping it avoids
+   confounding if removing it matters. If Experiment 2 shows partial progress,
+   we can toggle it.
+
+**Unknowns / risks:**
+- The landmark struct layout is guessed. If the game reads specific fields
+  (e.g. a descriptor, a view direction) at offsets we left as zero, it may
+  ignore the fake landmark or crash.
+- Whether retval is a count (like `GetInitializationPointInfo`) or an
+  error code. If it's an error code, retval=1 might mean "error" not
+  "1 landmark" — in which case the game would still see failure. (Recon
+  showed LLE returns 0 = "no landmarks"; treating non-zero as "landmarks
+  exist" is the best inference.)
+- Whether the game iterates landmarks by index (needs per-index handling)
+  or reads them all from one call. We handle both: index 0 → fake, index >0
+  → empty.
+
+**Test status:** AWAITING user run — load the Xtractor minigame, let it
+color-lock, and observe whether objects spawn. Check `vita3k.log` for
+`EXPERIMENT2: faked 1 landmark` lines.
+
+**Test result (2026-11-19):** NOTHING SPAWNED. Root cause: the `index == 0`
+gate never fired — the game passes r3=8336 (0x2090) on EVERY GetLandmarkInfo
+call (constant, not a per-landmark index). The game does NOT iterate landmark
+indices; it calls GetLandmarkInfo with fixed args every frame. 0 EXPERIMENT2
+lines in the log. Color-lock worked (init-point count progressed 0→64).
+**Fix applied:** removed the `index == 0` condition — now always fakes when
+LLE returns retval=0 with a valid buffer. Rebuilt; awaiting re-test.
+
 **Open question:** which sub-struct (+0x04 or +0x10) holds the tracking state,
 and at what offset? Step 1b extends the dump to follow these pointers (128 bytes
 each) and captures the **idle → color-bar-filling → locked transition** (the
@@ -394,37 +496,78 @@ cmd /c C:\Users\rianp\AppData\Local\Temp\opencode\build_wrapper.bat
 - Git: 5 commits on `hybrid-hle-override` (recon trampoline + 3 recon extensions + Step 2 exp1), ready to push
 - **Status: PAUSED for testing.** Next is Step 2 Experiment 2 (fake `GetLandmarkInfo` retval + buffer) or Experiment 4 (disassemble game binary to find the exact "tracking locked" check).
 
+### Session 4 (Step 2 Experiment 2 implementation)
+- Extended the generic recon trampoline to preserve entry r2→r7, r3→r8 (LLE
+  clobbers r0-r3); dump handlers now receive r3=entry r3 (landmark index).
+  Trampoline grew from 64→80 bytes; push/pop encodings updated.
+- Confirmed the return-value override mechanism: trampoline's final `mov r0, r6`
+  runs after the SVC returns, and `write_call_result` only overwrites r0 — so
+  `cpu.set_reg(6, newval)` in a host handler changes the game's visible retval.
+- Implemented Experiment 2 in `dump_landmark_info`: when LLE returns retval=0
+  with index==0, zero the 512-byte buffer, write a minimal fake landmark
+  (pos (0,0,1), quality 1.0, valid flag), and set retval→1 via `set_reg(6,1)`.
+  index>0 left as retval=0 (no more landmarks).
+- PropagateResult Experiment 1 override kept active (harmless).
+- Build: clean (exit 0), `Vita3K.exe` rebuilt 2026-11-19.
+- **Status: AWAITING TEST.** Next is a user run of the Xtractor minigame to see
+  if objects spawn.
+
+### Session 5 (Experiment 2c/2d + full disassembly)
+- Experiment 2 (fake GetLandmarkInfo retval+buffer): first run had a bug —
+  `index == 0` gate never fired (game passes r3=8336=0x2090 every call, a
+  struct offset, NOT a landmark index). Fixed: removed the index condition.
+  Re-tested: override fired (10,448 EXP2c lines) but nothing spawned.
+- Experiment 2c: set `[struct+0x2000+0x54]` bit0 via `struct_base = buf - 0x2798`
+  (corrected from the wrong `+0x54` offset — off by 0x2000). Re-tested:
+  override fired at correct address (6,069 EXP2c lines, `+0x2054: 0x1->0x1`).
+  `sceSmartSceneMappingRunCore` IS called now, but it's LLE SLAM processing
+  — runs but can't solve tracking in the emulator. Nothing spawned.
+- Experiment 2d: filled DispatchAndQuery result struct `+0x10..+x28` with an
+  identity pose (7 floats). **CRASHED** — LLE DispatchAndQuery reads back the
+  `+0x10` (p10 pointer) on the next call; overwriting with a float
+  broke it. Reverted.
+- Built a capstone-based disassembly scanner (`disassemble_smartar_callsites`)
+  that finds all SmartAR call sites in the game's code segment and
+  dumps the full annotated disassembly. Found 8 call sites in Thumb
+  mode, all in one function cluster (`0x814FEB12`–`0x814FF062`).
+- Identified the critical function `0x8185df64` =
+  `sceSmartSceneMappingRunCore` (NID 0xCB30BD4D) — the core SLAM
+  processing, called only when `[struct+0x2000+0x54]` bit0 is set.
+- Mapped the complete per-frame call flow, per-camera struct offsets,
+  gates, and the two-function architecture (Function A = pose extractor,
+  Function B = main AR loop). See `STRUCTURE.md` for the full reference.
+- Created `STRUCTURE.md` (structure reference) and `disasm_full.txt`
+  (raw disassembly).
+- **Files modified:** `vita3k/modules/SceSmart/smartar_recon.cpp`
+- **Files added:** `STRUCTURE.md`, `disasm_full.txt`
+- **Status: STALLED.** All faking approaches hit the fundamental limitation
+  that LLE SLAM can't solve in the emulator. Next options documented in
+  `STRUCTURE.md` and `## Next Action`.
+- Extended the generic recon trampoline to preserve entry r2→r7, r3→r8 (LLE
+  clobbers r0-r3); dump handlers now receive r3=entry r3 (landmark index).
 ---
 
 ## Next Action
 
-**Step 2 — Hybrid HLE override (PAUSED — Experiment 1 failed, next is Experiment 2):**
+**Step 2 — Hybrid HLE override: STALLED (fundamental limitation hit)**
 
-Experiment 1 (force `prop+0x08=2` in PropagateResult) did not spawn objects.
-The game's "tracking locked" gate is NOT in the `prop` buffer state enum. Most
-likely the game checks `GetLandmarkInfo` for non-empty landmark data directly.
+All faking approaches tried (Experiments 1, 2,2c,2d) failed. See
+`STRUCTURE.md` for the complete disassembly findings and the remaining
+options. The fundamental problem: the LLE SLAM algorithm (`RunCore` +
+`DispatchAndQuery`) cannot produce a valid 6DOF pose in the emulator, and
+faking individual outputs doesn't work because the LLE code needs its
+internal data structures (pointers) to be consistent.
 
-**Next experiment (Experiment 2):** Fake `GetLandmarkInfo`:
-1. In the `GetLandmarkInfo` trampoline's host handler, after LLE runs (returns
-   0 with empty buffer), overwrite retval to non-zero AND fill the 512-byte
-   buffer with a minimal fake landmark.
-2. Unknown: the landmark struct layout. SmartAR landmarks are 3D map points
-   (position + descriptor + quality). Try: position floats (0,0,0) at +0x00,
-   a "valid" flag, and zeros elsewhere. Risk: wrong layout → crash or no effect.
-3. If the game iterates landmarks by index, may need to fake index 0 only and
-   return an "end" error for index 1+.
-
-**Decisive fallback (Experiment 4):** Disassemble the game binary around the
-`GetLandmarkInfo` / `DispatchAndQuery` call sites (using the capstone disassembler
-already in Vita3K, or a standalone tool) to find the exact field/branch the game
-checks for "tracking locked". This is the most work but removes all guesswork.
-
-**Key files for this work:**
-- `vita3k/modules/SceSmart/smartar_recon.cpp` — recon trampolines + Step 2 override host handlers
-- `vita3k/modules/taiHEN/taiHEN.cpp` — `register_hle_override()` at line 1299 (alternate override mechanism)
-- `vita3k/modules/SceSmart/SceSmart.cpp` — HLE stubs (currently original UNIMPLEMENTED)
-- `vita3k/modules/module_parent.cpp` — `call_import` (recon NID dispatch) + `load_module` (hook trigger)
-- `vita3k/kernel/src/load_self.cpp` — export_nids registration + import stub re-patching (line 278)
+**Remaining options (see STRUCTURE.md "Possible next approaches"):**
+1. HLE-override `RunCore` (NID 0xCB30BD4D) — skip SLAM entirely, return
+   success. Risk: `RunCore` might be what sets `[r8+9]` (done flag).
+2. Fill the p04 sub-buffer (pose output, pointed to by result+0x04)
+   with an identity pose, without touching the result struct pointer fields.
+3. Provide camera calibration + sync IMU with camera motion so SLAM can
+   actually solve. Much bigger task.
+4. Disassemble Function A fully (starts before our current dump
+   range) to understand where the 7 "pose floats" on its stack come from when
+   tracking IS locked.
 
 ---
 
